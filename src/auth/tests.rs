@@ -10,12 +10,15 @@ fn headers_with(value: &str) -> HeaderMap {
 
 fn keys(const_keys: &[&str]) -> ApiKeys {
     let configured: Vec<String> = const_keys.iter().map(|key| (*key).to_string()).collect();
-    ApiKeys::from_config(&configured).unwrap()
+    ApiKeys::from_config(Some(&configured)).unwrap()
 }
 
 #[test]
 fn no_configured_keys_means_no_gate() {
-    assert!(ApiKeys::from_config(&[]).is_none());
+    assert!(ApiKeys::from_config(None).is_none());
+    // Defense in depth: `validate` refuses an empty list, so this can never
+    // become an uncrackable gate either.
+    assert!(ApiKeys::from_config(Some(&[])).is_none());
 }
 
 #[test]

@@ -534,7 +534,7 @@ fast = [{ provider = "openai", model = "gpt-4o-mini" }]
 }
 
 #[test]
-fn api_keys_default_to_empty() {
+fn api_keys_default_to_absent() {
     let toml_str = r#"
 [provider.openai]
 base_url = "https://api.openai.com/v1"
@@ -544,13 +544,27 @@ api_key = "sk-test"
 fast = [{ provider = "openai", model = "gpt-4o-mini" }]
 "#;
     let config: Config = toml::from_str(toml_str).unwrap();
-    assert!(config.api_keys.is_empty());
+    assert_eq!(config.api_keys, None);
     assert!(config.validate().is_ok());
-    // An explicit empty list is the same as leaving it out.
-    let toml_str = format!("api_keys = []\n{toml_str}");
-    let config: Config = toml::from_str(&toml_str).unwrap();
-    assert!(config.api_keys.is_empty());
-    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn an_empty_api_keys_list_is_refused_rather_than_opening_the_proxy() {
+    // A templated config that renders `api_keys = []` when no secret is set
+    // must fail loudly, not silently ship the open proxy it meant to close.
+    let toml_str = r#"
+api_keys = []
+
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini" }]
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    let err = config.validate().unwrap_err().to_string();
+    assert!(err.contains("api_keys"), "unhelpful error: {err}");
 }
 
 #[test]
@@ -566,8 +580,31 @@ api_key = "sk-test"
 fast = [{ provider = "openai", model = "gpt-4o-mini" }]
 "#;
     let config: Config = toml::from_str(toml_str).unwrap();
-    assert_eq!(config.api_keys, ["key-1", "key-2"]);
+    assert_eq!(
+        config.api_keys,
+        Some(vec!["key-1".to_string(), "key-2".to_string()])
+    );
     assert!(config.validate().is_ok());
+}
+
+#[test]
+fn non_ascii_api_key_is_rejected() {
+    // An HTTP header value is ASCII, so a key with anything else is one no
+    // client can ever present.
+    let toml_str = r#"
+api_keys = ["clé"]
+
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini" }]
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    let err = config.validate().unwrap_err().to_string();
+    assert!(err.contains("api_keys"), "unhelpful error: {err}");
+    assert!(err.contains("ASCII"), "unhelpful error: {err}");
 }
 
 #[test]

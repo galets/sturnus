@@ -15,10 +15,10 @@ pub struct Config {
     pub metrics_listen: Option<String>,
     pub provider: HashMap<String, ProviderConfig>,
     pub model: HashMap<String, Vec<ModelCandidate>>,
-    /// Keys callers must present to proxy through this instance. Empty (the
+    /// Keys callers must present to proxy through this instance. Absent (the
     /// default) means the proxy is open, as it is by default on loopback.
     #[serde(default)]
-    pub api_keys: Vec<String>,
+    pub api_keys: Option<Vec<String>>,
     #[serde(default)]
     pub routing: RoutingConfig,
     /// Labels merged into outbound bodies as `labels` for opt-in Vertex
@@ -353,13 +353,23 @@ impl Config {
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         self.listen_addrs()?;
-        for key in &self.api_keys {
-            if key.trim().is_empty() {
-                anyhow::bail!("api_keys must not contain an empty key");
+        if let Some(keys) = &self.api_keys {
+            if keys.is_empty() {
+                // An empty list is how a templated config renders "no secrets
+                // yet"; honouring it would silently open the proxy.
+                anyhow::bail!("api_keys is empty; drop it to run an open proxy, or list a key");
             }
-            if key.trim().len() != key.len() {
-                // The key is never printed: config errors are logged.
-                anyhow::bail!("api_keys entries must not have surrounding whitespace");
+            for key in keys {
+                // Keys are never printed: config errors end up in logs.
+                if key.trim().is_empty() {
+                    anyhow::bail!("api_keys must not contain an empty key");
+                }
+                if key.trim().len() != key.len() {
+                    anyhow::bail!("api_keys entries must not have surrounding whitespace");
+                }
+                if !key.is_ascii() {
+                    anyhow::bail!("api_keys entries must be ASCII: a header value is ASCII-only");
+                }
             }
         }
         if !(0.0..=1.0).contains(&self.routing.ewma_alpha) {

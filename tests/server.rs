@@ -59,7 +59,7 @@ fn state_from_config(config_toml: &str, budget_kb: usize) -> Arc<AppState> {
         budget: BufferBudget::new(budget_kb * 1024, 32 * 1024 * 1024),
         metrics: Metrics::new(),
         shutting_down: AtomicBool::new(false),
-        api_keys: sturnus::auth::ApiKeys::from_config(&config.api_keys),
+        api_keys: sturnus::auth::ApiKeys::from_config(config.api_keys.as_deref()),
     })
 }
 
@@ -1115,7 +1115,7 @@ async fn watched_upstream() -> (u16, oneshot::Receiver<()>, tokio::task::JoinHan
 }
 
 /// Long enough that a forwarded request would have reached the upstream.
-const NOT_FORWARDED: Duration = Duration::from_millis(100);
+const NO_FORWARD_GRACE: Duration = Duration::from_millis(100);
 
 #[tokio::test]
 async fn proxied_post_with_the_wrong_credentials_gets_401() {
@@ -1144,7 +1144,7 @@ async fn proxied_post_with_the_wrong_credentials_gets_401() {
     }
 
     assert!(
-        tokio::time::timeout(NOT_FORWARDED, connected)
+        tokio::time::timeout(NO_FORWARD_GRACE, connected)
             .await
             .is_err(),
         "a rejected request must never reach the upstream"
@@ -1171,11 +1171,55 @@ async fn proxied_post_without_api_key_gets_401() {
     assert_eq!(body["error"]["type"], "invalid_request_error");
 
     assert!(
-        tokio::time::timeout(NOT_FORWARDED, connected)
+        tokio::time::timeout(NO_FORWARD_GRACE, connected)
             .await
             .is_err(),
         "a rejected request must never reach the upstream"
     );
+    mock_handle.abort();
+}
+
+#[tokio::test]
+async fn api_keys_do_not_gate_the_observability_listener() {
+    use sturnus::server::{run_server_with_role, ServerRole};
+
+    let (mock_port, connected, mock_handle) = watched_upstream().await;
+    let state = state_with_api_keys(mock_port, &["secret-key"]);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (_tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(run_server_with_role(
+        listener,
+        state,
+        ServerRole::Observability,
+        async {
+            let _ = rx.await;
+        },
+        Duration::from_secs(1),
+    ));
+
+    // The whole reason this listener exists — uncredentialed scrapes and probes.
+    for path in ["/health", "/status", "/metrics"] {
+        let resp = reqwest::get(format!("http://{addr}{path}")).await.unwrap();
+        assert_eq!(resp.status(), 200, "{path} must stay open");
+    }
+
+    // Nor is it a way around the gate: it never proxies, key or no key.
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&serde_json::json!({"model": "fast", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    assert!(
+        tokio::time::timeout(NO_FORWARD_GRACE, connected)
+            .await
+            .is_err(),
+        "the observability listener must never reach the upstream"
+    );
+
     mock_handle.abort();
 }
 

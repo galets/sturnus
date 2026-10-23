@@ -14,8 +14,8 @@ impl ApiKeys {
     /// `None` when nothing is configured, keeping "this instance does not
     /// authenticate callers" a type-level fact rather than an empty set that
     /// happens to reject everything.
-    pub fn from_config(keys: &[String]) -> Option<Self> {
-        (!keys.is_empty()).then(|| Self {
+    pub fn from_config(configured: Option<&[String]>) -> Option<Self> {
+        configured.filter(|keys| !keys.is_empty()).map(|keys| Self {
             keys: keys.to_vec(),
         })
     }

@@ -133,10 +133,12 @@ pub async fn handle_request(
     }
 
     // The gate sits ahead of everything else that costs anything: a rejected
-    // request neither reads a body nor reaches an upstream.
+    // request neither reads a body nor reaches an upstream. Logged at debug,
+    // in line with the other client-error responses: an unauthenticated
+    // scanner must not be able to write the log at its own rate.
     if let Some(api_keys) = state.api_keys.as_ref() {
         if !api_keys.is_authorized(req.headers()) {
-            warn!("rejected a request without a valid API key");
+            debug!("rejected a request without a valid API key");
             return Ok(access_denied());
         }
     }

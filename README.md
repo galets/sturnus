@@ -150,7 +150,7 @@ Clients pass it exactly as they pass a provider key — with the OpenAI SDK it i
 - The only accepted form is `Authorization: Bearer <key>`, matched exactly. Comparison reads both sides fully, so a wrong guess costs the same time however close it was.
 - The `GET` observability routes (`/health`, `/healthz`, `/status`, `/metrics`) stay keyless, so container health probes and Prometheus scrapes need no secrets.
 - The keys gate the proxy and nothing else: they are never logged, and never relayed upstream — the provider's own `api_key` authenticates the outbound request.
-- An empty or whitespace-padded entry fails at startup rather than becoming a key no client can present. Leaving `api_keys` unset keeps the proxy open, which is the right default on loopback.
+- Startup refuses a key it could never use — blank, whitespace-padded, or non-ASCII — and refuses `api_keys = []` outright rather than treating it as no gate. Leaving `api_keys` unset keeps the proxy open, which is the right default on loopback.
 
 </details>
 

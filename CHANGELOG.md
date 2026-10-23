@@ -19,7 +19,10 @@ their history lives in the git log and tags.
   Bearer`, before its body is read or an upstream is contacted. The observability
   routes (`/health`, `/healthz`, `/status`, `/metrics`) stay keyless so container
   health probes and Prometheus scrapes keep working, and the keys are never
-  logged or relayed upstream. Leaving it unset changes nothing.
+  logged or relayed upstream. Leaving it unset changes nothing. A present-but-empty
+  list fails at startup rather than quietly disabling the gate, as does any entry
+  that is blank, whitespace-padded, or non-ASCII — those are keys no client could
+  ever present.
 
 ### Changed
 
