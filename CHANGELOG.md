@@ -9,6 +9,23 @@ rename it.
 Releases up to and including 4.3.0 were published under the `llmrouter` name;
 their history lives in the git log and tags.
 
+## [Unreleased]
+
+### Changed
+
+- **Breaking (bare-metal):** the default config location is now
+  `$HOME/.config/sturnus.toml` rather than `./config.toml` in the working
+  directory. `--config` is unchanged and still overrides it. If `HOME` is
+  unset and no `--config` is given, startup fails naming both fixes, rather
+  than reading a path relative to wherever the process was started. The
+  container images are unaffected — they pass `--config /config.toml`
+  themselves, so the documented `-v ./config.toml:/config.toml` mount keeps
+  working.
+- A repeated `--config` now replaces the earlier value instead of being
+  rejected, so `docker run <image> --config /other.toml` overrides the
+  image's built-in path.
+- The config path actually loaded is logged at startup.
+
 ## [5.3.0] - 2026-08-25
 
 ### Added

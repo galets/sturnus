@@ -2,8 +2,9 @@ use crate::model_map::ProviderKind;
 use hyper::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -271,6 +272,21 @@ fn parse_cgroup_v1(raw: &str) -> Option<u64> {
 }
 
 impl Config {
+    pub fn default_path() -> anyhow::Result<PathBuf> {
+        let home = std::env::var_os("HOME");
+        Self::path_in_home(home.as_deref())
+    }
+
+    fn path_in_home(home: Option<&OsStr>) -> anyhow::Result<PathBuf> {
+        let Some(home) = home.filter(|home| !home.is_empty()) else {
+            anyhow::bail!(
+                "HOME is not set, so the default config location is unknown; \
+                 set HOME or pass --config"
+            );
+        };
+        Ok(PathBuf::from(home).join(".config").join("sturnus.toml"))
+    }
+
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("failed to read config file '{}': {e}", path.display()))?;

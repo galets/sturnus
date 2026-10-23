@@ -581,3 +581,23 @@ mod env_dir {
         std::env::remove_var("TEST_DIR_VIS");
     }
 }
+
+mod default_path {
+    use super::*;
+
+    #[test]
+    fn nests_under_dot_config() {
+        let path = Config::path_in_home(Some(OsStr::new("/home/operator"))).unwrap();
+        assert_eq!(path, PathBuf::from("/home/operator/.config/sturnus.toml"));
+    }
+
+    #[test]
+    fn absent_or_empty_home_says_to_pass_config() {
+        // The process env is never touched, so these stay parallel-safe.
+        for home in [None, Some(OsStr::new(""))] {
+            let err = Config::path_in_home(home).unwrap_err().to_string();
+            assert!(err.contains("HOME"), "unhelpful error: {err}");
+            assert!(err.contains("--config"), "unhelpful error: {err}");
+        }
+    }
+}

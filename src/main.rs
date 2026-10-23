@@ -27,9 +27,12 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Path to config TOML file
-    #[arg(short, long, default_value = "config.toml")]
-    config: PathBuf,
+    /// Path to config TOML file [default: $HOME/.config/sturnus.toml]
+    // `overrides_with` names this arg so a later --config replaces an earlier
+    // one: the container image injects --config /config.toml, and
+    // `docker run … --config X` must be able to replace it.
+    #[arg(short, long, overrides_with = "config")]
+    config: Option<PathBuf>,
 
     /// Load a .env file into process env vars before reading config
     #[arg(short, long = "env-file")]
@@ -130,10 +133,15 @@ async fn main() -> anyhow::Result<()> {
         info!(path = %env_dir.display(), "loaded env dir");
     }
 
-    let config = sturnus::config::Config::load(&cli.config)?;
+    let config_path = match cli.config {
+        Some(path) => path,
+        None => sturnus::config::Config::default_path()?,
+    };
+    let config = sturnus::config::Config::load(&config_path)?;
 
     info!(listen = %config.listen, "starting sturnus");
     info!(
+        path = %config_path.display(),
         providers = config.provider.len(),
         models = config.model.len(),
         "loaded config"
@@ -247,4 +255,29 @@ async fn main() -> anyhow::Result<()> {
 
     info!("server stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_is_optional_so_the_home_default_can_apply() {
+        let cli = Cli::parse_from(["sturnus"]);
+        assert_eq!(cli.config, None);
+    }
+
+    #[test]
+    fn later_config_replaces_earlier() {
+        // The container image injects --config /config.toml; a --config from
+        // `docker run` is appended after it and has to win.
+        let cli = Cli::parse_from([
+            "sturnus",
+            "-c",
+            "/config.toml",
+            "--config",
+            "/etc/other.toml",
+        ]);
+        assert_eq!(cli.config, Some(PathBuf::from("/etc/other.toml")));
+    }
 }

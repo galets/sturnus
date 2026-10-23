@@ -10,7 +10,7 @@ LLM providers have variable latency and availability that can break production f
 
 ## Quick start
 
-sturnus needs a `config.toml` — copy `config.example.toml` and add your providers.
+sturnus needs a config file — copy `config.example.toml` and add your providers. It reads `~/.config/sturnus.toml` by default; `--config <path>` reads one from anywhere.
 
 **Docker** — best for production deployments and Kubernetes sidecars:
 
@@ -81,6 +81,8 @@ sturnus has a bounded scope by design and has some deliberate omissions:
 - [Building](#building)
 
 ## Configuration
+
+sturnus reads `~/.config/sturnus.toml` unless `--config <path>` (`-c`) names a file. A repeated `--config` replaces the earlier one, which is how the container image's built-in `--config /config.toml` stays overridable. Startup fails, rather than running unconfigured, if the file is missing — or if `HOME` is unset and no `--config` was given.
 
 ```toml
 listen = "127.0.0.1:4000"
@@ -229,6 +231,8 @@ On Kubernetes, run sturnus as a [native sidecar](https://kubernetes.io/docs/conc
 Memory needs no tuning: the aggregate request-buffer budget defaults to half the container's memory limit (read from cgroups at startup, logged with its source), so a small sidecar sheds excess load with `429`s rather than getting OOM-killed. Override with `routing.max_buffered_bytes` if you want a different ceiling.
 
 The image is published as a multi-arch (amd64/arm64) scratch container to `ghcr.io/sturnus-dev/sturnus`. Tags follow semver: `:latest`, `:5.0`, `:5.0.0`.
+
+The image starts with `--config /config.toml` built in, so mounting the file there is all a container needs — the `~/.config/sturnus.toml` host default does not apply inside it. A `--config` you pass replaces the built-in one.
 
 To inject secrets via a mounted `.env` file:
 

@@ -14,4 +14,7 @@ COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certifi
 COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/sturnus /sturnus
 # Give gcp_auth a home to find ADC creds at $HOME/.config/gcloud/ (scratch sets none).
 ENV HOME=/root
-ENTRYPOINT ["/sturnus"]
+# The host default config path is $HOME/.config/sturnus.toml, but the documented
+# image mount is /config.toml, so name it here. A --config passed to `docker run`
+# comes after these args and wins.
+ENTRYPOINT ["/sturnus", "--config", "/config.toml"]
