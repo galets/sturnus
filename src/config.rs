@@ -15,6 +15,10 @@ pub struct Config {
     pub metrics_listen: Option<String>,
     pub provider: HashMap<String, ProviderConfig>,
     pub model: HashMap<String, Vec<ModelCandidate>>,
+    /// Keys callers must present to proxy through this instance. Empty (the
+    /// default) means the proxy is open, as it is by default on loopback.
+    #[serde(default)]
+    pub api_keys: Vec<String>,
     #[serde(default)]
     pub routing: RoutingConfig,
     /// Labels merged into outbound bodies as `labels` for opt-in Vertex
@@ -349,6 +353,15 @@ impl Config {
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         self.listen_addrs()?;
+        for key in &self.api_keys {
+            if key.trim().is_empty() {
+                anyhow::bail!("api_keys must not contain an empty key");
+            }
+            if key.trim().len() != key.len() {
+                // The key is never printed: config errors are logged.
+                anyhow::bail!("api_keys entries must not have surrounding whitespace");
+            }
+        }
         if !(0.0..=1.0).contains(&self.routing.ewma_alpha) {
             anyhow::bail!(
                 "ewma_alpha must be between 0.0 and 1.0, got {}",

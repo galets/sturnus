@@ -11,6 +11,16 @@ their history lives in the git log and tags.
 
 ## [Unreleased]
 
+### Added
+
+- **`api_keys`** — an optional top-level config list that gates the proxy. When
+  it is present, a proxied `POST` must present one of the keys in
+  `Authorization: Bearer <key>` or be answered with `401` + `WWW-Authenticate:
+  Bearer`, before its body is read or an upstream is contacted. The observability
+  routes (`/health`, `/healthz`, `/status`, `/metrics`) stay keyless so container
+  health probes and Prometheus scrapes keep working, and the keys are never
+  logged or relayed upstream. Leaving it unset changes nothing.
+
 ### Changed
 
 - **Breaking (bare-metal):** the default config location is now

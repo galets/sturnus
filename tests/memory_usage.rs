@@ -118,6 +118,7 @@ fast = [{{ provider = "test", model = "test-model" }}]
         budget: BufferBudget::new(128 * 1024 * 1024, 32 * 1024 * 1024),
         metrics: Metrics::new(),
         shutting_down: AtomicBool::new(false),
+        api_keys: None,
     })
 }
 

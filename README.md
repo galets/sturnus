@@ -52,6 +52,7 @@ response = client.chat.completions.create(
 - **Transparent passthrough** — only the `model` field is rewritten: the request body is otherwise forwarded byte-for-byte, preserving key order, number precision, and formatting. Responses, including SSE `text/event-stream` chunks, are relayed untouched as they arrive.
 - **Memory-bounded** — request buffers are capped per request and in aggregate; bursts beyond the memory budget shed load with `429` + `Retry-After` instead of OOMing the pod.
 - **Vertex AI support** — GKE Workload Identity auth via the metadata server, with automatic token refresh.
+- **Optional caller authentication** — `api_keys` puts a bearer-key gate in front of the proxy, answering unauthenticated requests with `401` while leaving health and metrics routes keyless.
 - **Zero infrastructure** — a single static binary; no Redis, database, or control plane.
 
 ## Why sturnus
@@ -136,6 +137,24 @@ Headers are per provider, not per model alias, so pointing two aliases at the sa
 </details>
 
 <details>
+<summary><b>Requiring an API key</b></summary>
+
+`api_keys` gates the proxy itself: every proxied `POST` must present one of the listed keys, and is otherwise answered with `401`.
+
+```toml
+api_keys = ["${STURNUS_API_KEY}", "old-key-still-rotating"]
+```
+
+Clients pass it exactly as they pass a provider key — with the OpenAI SDK it is the `api_key` argument.
+
+- The only accepted form is `Authorization: Bearer <key>`, matched exactly. Comparison reads both sides fully, so a wrong guess costs the same time however close it was.
+- The `GET` observability routes (`/health`, `/healthz`, `/status`, `/metrics`) stay keyless, so container health probes and Prometheus scrapes need no secrets.
+- The keys gate the proxy and nothing else: they are never logged, and never relayed upstream — the provider's own `api_key` authenticates the outbound request.
+- An empty or whitespace-padded entry fails at startup rather than becoming a key no client can present. Leaving `api_keys` unset keeps the proxy open, which is the right default on loopback.
+
+</details>
+
+<details>
 <summary><b>Vertex billing attribution</b></summary>
 
 For Vertex providers, sturnus can inject sidecar-controlled `labels` into outbound requests so the resulting spend shows up tagged in GCP Billing Export. The labels live in a top-level `[attribution]` block (typically deployment identity sourced from env vars) and are merged into each request body for any Vertex provider that opts in:
@@ -164,7 +183,7 @@ Sidecar keys take precedence over any client-supplied `labels` keys with the sam
 | GET | `/status` | Returns current streaming/non-streaming EWMAs, error rate, and status per candidate |
 | GET | `/metrics` | Prometheus metrics (see below) |
 
-The `POST` proxy routes are served only on `listen`. The `GET` observability routes are served on `listen` and, when configured, on `metrics_listen`.
+The `POST` proxy routes are served only on `listen`. The `GET` observability routes are served on `listen` and, when configured, on `metrics_listen`. When `api_keys` is configured, the `POST` routes additionally require `Authorization: Bearer <key>`; the observability routes never do.
 
 ## Observability
 

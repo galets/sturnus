@@ -533,6 +533,86 @@ fast = [{ provider = "openai", model = "gpt-4o-mini" }]
     assert!(config.validate().is_err());
 }
 
+#[test]
+fn api_keys_default_to_empty() {
+    let toml_str = r#"
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini" }]
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert!(config.api_keys.is_empty());
+    assert!(config.validate().is_ok());
+    // An explicit empty list is the same as leaving it out.
+    let toml_str = format!("api_keys = []\n{toml_str}");
+    let config: Config = toml::from_str(&toml_str).unwrap();
+    assert!(config.api_keys.is_empty());
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn api_keys_are_read_from_the_top_level() {
+    let toml_str = r#"
+api_keys = ["key-1", "key-2"]
+
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini" }]
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.api_keys, ["key-1", "key-2"]);
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn blank_api_key_is_rejected() {
+    // A blank entry would be a key nobody can ever present, and an
+    // `Authorization: Bearer ` prefix match away from a hole.
+    for key in ["", "   "] {
+        let toml_str = format!(
+            r#"
+api_keys = ["{key}"]
+
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{{ provider = "openai", model = "gpt-4o-mini" }}]
+"#
+        );
+        let config: Config = toml::from_str(&toml_str).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("api_keys"), "unhelpful error: {err}");
+    }
+}
+
+#[test]
+fn api_key_with_surrounding_whitespace_is_rejected() {
+    // A stray space is a key no client can ever present: the request-side
+    // token is exactly what the `Bearer ` prefix leaves behind.
+    let toml_str = r#"
+api_keys = [" sk-live "]
+
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini" }]
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    let err = config.validate().unwrap_err().to_string();
+    assert!(err.contains("api_keys"), "unhelpful error: {err}");
+    assert!(err.contains("whitespace"), "unhelpful error: {err}");
+}
+
 mod env_dir {
     use super::*;
     use std::io::Write;

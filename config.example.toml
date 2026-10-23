@@ -4,6 +4,11 @@ listen = "127.0.0.1:4000"
 # Bind to a routable address so Prometheus can scrape while the proxy stays on loopback.
 # metrics_listen = "0.0.0.0:4040"
 
+# Optional caller-facing keys. When present, every proxied request must carry
+# one in `Authorization: Bearer <key>` or it is answered with 401. The
+# observability routes (/health, /healthz, /status, /metrics) stay keyless.
+# api_keys = ["${STURNUS_API_KEY}"]
+
 # Providers: where to send requests
 
 [provider.openai]

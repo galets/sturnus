@@ -16,6 +16,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn, Instrument};
 
+use crate::auth::ApiKeys;
 use crate::gcp_auth::GcpTokenProvider;
 use crate::metrics::Metrics;
 use crate::model_map::ModelMap;
@@ -33,6 +34,9 @@ pub struct AppState {
     pub budget: BufferBudget,
     pub metrics: Metrics,
     pub shutting_down: AtomicBool,
+    /// When set, every proxied request must present one of these keys.
+    /// Observability routes stay open so probes and scrapes need no secrets.
+    pub api_keys: Option<ApiKeys>,
 }
 
 /// Caps how much memory all in-flight requests may spend buffering bodies,
@@ -91,6 +95,20 @@ fn json_error(status: hyper::StatusCode, message: &str) -> Response<BoxBody> {
     json_response(status, bytes)
 }
 
+/// The answer to a request that failed the API key gate. No key material is
+/// ever echoed back.
+fn access_denied() -> Response<BoxBody> {
+    let mut resp = json_error(
+        hyper::StatusCode::UNAUTHORIZED,
+        "missing or invalid API key",
+    );
+    resp.headers_mut().insert(
+        hyper::header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer"),
+    );
+    resp
+}
+
 pub async fn handle_request(
     mut req: Request<hyper::body::Incoming>,
     state: Arc<AppState>,
@@ -112,6 +130,15 @@ pub async fn handle_request(
             hyper::StatusCode::METHOD_NOT_ALLOWED,
             "method not allowed",
         ));
+    }
+
+    // The gate sits ahead of everything else that costs anything: a rejected
+    // request neither reads a body nor reaches an upstream.
+    if let Some(api_keys) = state.api_keys.as_ref() {
+        if !api_keys.is_authorized(req.headers()) {
+            warn!("rejected a request without a valid API key");
+            return Ok(access_denied());
+        }
     }
 
     let affinity_header = req.headers_mut().remove("x-session-affinity");

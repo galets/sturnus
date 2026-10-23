@@ -147,6 +147,15 @@ async fn main() -> anyhow::Result<()> {
         "loaded config"
     );
 
+    // Startup posture, logged as a count: the keys themselves never appear.
+    match config.api_keys.len() {
+        0 => info!("api_keys is empty, so proxied requests are not authenticated"),
+        n => info!(
+            keys = n,
+            "api_keys configured, proxied requests require a bearer key"
+        ),
+    }
+
     let mut tracker = Tracker::new(config.routing.ewma_alpha, config.routing.error_threshold);
     let model_map = ModelMap::from_config(&config, &mut tracker)?;
 
@@ -217,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
         budget,
         metrics,
         shutting_down: AtomicBool::new(false),
+        api_keys: sturnus::auth::ApiKeys::from_config(&config.api_keys),
     });
 
     let (addr, metrics_addr) = config.listen_addrs()?;

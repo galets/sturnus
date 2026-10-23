@@ -59,7 +59,32 @@ fn state_from_config(config_toml: &str, budget_kb: usize) -> Arc<AppState> {
         budget: BufferBudget::new(budget_kb * 1024, 32 * 1024 * 1024),
         metrics: Metrics::new(),
         shutting_down: AtomicBool::new(false),
+        api_keys: sturnus::auth::ApiKeys::from_config(&config.api_keys),
     })
+}
+
+/// State whose config declares the given caller-facing `api_keys`.
+fn state_with_api_keys(upstream_port: u16, keys: &[&str]) -> Arc<AppState> {
+    let list = keys
+        .iter()
+        .map(|key| format!("\"{key}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    state_from_config(
+        &format!(
+            r#"
+api_keys = [{list}]
+
+[provider.test]
+base_url = "http://127.0.0.1:{upstream_port}"
+api_key = "fake"
+
+[model]
+fast = [{{ provider = "test", model = "test-model" }}]
+"#,
+        ),
+        128 * 1024,
+    )
 }
 
 fn test_state() -> Arc<AppState> {
@@ -672,6 +697,7 @@ fast = [
         budget: BufferBudget::new(128 * 1024 * 1024, 32 * 1024 * 1024),
         metrics: Metrics::new(),
         shutting_down: AtomicBool::new(false),
+        api_keys: None,
     });
     let (addr, _tx, _server) = start_server(state);
     let client = reqwest::Client::new();
@@ -771,6 +797,7 @@ fast = [
         budget: BufferBudget::new(128 * 1024 * 1024, 32 * 1024 * 1024),
         metrics: Metrics::new(),
         shutting_down: AtomicBool::new(false),
+        api_keys: None,
     });
     let (addr, _tx, _server) = start_server(state);
 
@@ -1070,6 +1097,134 @@ async fn oversized_nonstreaming_response_rejected() {
         state.tracker.stats(stats_index).success_rate() < 1.0,
         "an oversized response must feed the error signal"
     );
+
+    mock_handle.abort();
+}
+
+/// Mock upstream that reports the first time anything connects to it, without
+/// ever answering. A proxy that forwards a request it should have rejected
+/// trips the receiver.
+async fn watched_upstream() -> (u16, oneshot::Receiver<()>, tokio::task::JoinHandle<()>) {
+    let (listener, port) = common::bind().await;
+    let (tx, rx) = oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        let (_conn, _) = listener.accept().await.unwrap();
+        let _ = tx.send(());
+    });
+    (port, rx, handle)
+}
+
+/// Long enough that a forwarded request would have reached the upstream.
+const NOT_FORWARDED: Duration = Duration::from_millis(100);
+
+#[tokio::test]
+async fn proxied_post_with_the_wrong_credentials_gets_401() {
+    let (mock_port, connected, mock_handle) = watched_upstream().await;
+    let state = state_with_api_keys(mock_port, &["secret-key"]);
+    let (addr, _tx, _server) = start_server(state);
+
+    // None of these present the configured key.
+    for credentials in [
+        "secret-key",
+        "Basic c2VjcmV0LWtleQ==",
+        "Bearer other-key",
+        "Bearer secret-ke",
+        "Bearer secret-keys",
+        "Bearer ",
+        "Bearer",
+    ] {
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("authorization", credentials)
+            .json(&serde_json::json!({"model": "fast", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "{credentials:?} must be rejected");
+    }
+
+    assert!(
+        tokio::time::timeout(NOT_FORWARDED, connected)
+            .await
+            .is_err(),
+        "a rejected request must never reach the upstream"
+    );
+    mock_handle.abort();
+}
+
+#[tokio::test]
+async fn proxied_post_without_api_key_gets_401() {
+    let (mock_port, connected, mock_handle) = watched_upstream().await;
+    let state = state_with_api_keys(mock_port, &["secret-key"]);
+    let (addr, _tx, _server) = start_server(state);
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&serde_json::json!({"model": "fast", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 401);
+    assert_eq!(resp.headers().get("www-authenticate").unwrap(), "Bearer");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+
+    assert!(
+        tokio::time::timeout(NOT_FORWARDED, connected)
+            .await
+            .is_err(),
+        "a rejected request must never reach the upstream"
+    );
+    mock_handle.abort();
+}
+
+#[tokio::test]
+async fn a_configured_api_key_opens_the_proxy_and_stays_out_of_the_upstream() {
+    let (mock_port, head_rx, mock_handle) = capturing_upstream().await;
+    let state = state_with_api_keys(mock_port, &["first-key", "second-key"]);
+    let (addr, _tx, _server) = start_server(state);
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("authorization", "Bearer second-key")
+        .json(&serde_json::json!({"model": "fast", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    let head = tokio::time::timeout(Duration::from_secs(5), head_rx)
+        .await
+        .unwrap()
+        .unwrap()
+        .to_ascii_lowercase();
+    // The upstream authenticates with the provider's own key.
+    assert!(
+        head.contains("authorization: bearer fake"),
+        "upstream must receive the provider key:\n{head}"
+    );
+    assert!(
+        !head.contains("second-key"),
+        "the caller's sturnus key must never be relayed:\n{head}"
+    );
+
+    mock_handle.abort();
+}
+
+#[tokio::test]
+async fn observability_routes_stay_open_when_api_keys_are_configured() {
+    let (mock_port, mock_handle) = instant_upstream(0).await;
+    let state = state_with_api_keys(mock_port, &["secret-key"]);
+    let (addr, _tx, _server) = start_server(state);
+
+    // Health probes and scrapes carry no key, so gating them would break the
+    // container healthcheck and Prometheus.
+    for path in ["/health", "/healthz", "/status", "/metrics"] {
+        let resp = reqwest::get(format!("http://{addr}{path}")).await.unwrap();
+        assert_eq!(resp.status(), 200, "{path} must stay open");
+    }
 
     mock_handle.abort();
 }
