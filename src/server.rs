@@ -538,7 +538,19 @@ pub async fn run_server_with_role(
 
                 tokio::spawn(async move {
                     if let Err(e) = conn.await {
-                        if !e.to_string().contains("connection closed") {
+                        let is_disconnect = std::error::Error::source(&e)
+                            .and_then(|src| src.downcast_ref::<std::io::Error>())
+                            .map_or(false, |io_err| {
+                                matches!(
+                                    io_err.kind(),
+                                    std::io::ErrorKind::ConnectionReset
+                                        | std::io::ErrorKind::ConnectionAborted
+                                        | std::io::ErrorKind::NotConnected
+                                        | std::io::ErrorKind::BrokenPipe
+                                )
+                            });
+
+                        if !is_disconnect {
                             error!(remote = %remote, error = %e, "connection error");
                         }
                     }
