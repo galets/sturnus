@@ -239,10 +239,20 @@ async fn dropping_a_counted_stream_mid_flight_returns_the_in_flight_count() {
 /// A stream that ends on its own returns its count too — and the count is
 /// returned exactly once: releasing at end of stream must not be followed by a
 /// second release when the finished body is finally dropped.
+///
+/// A second request is counted against the same candidate and stays in flight
+/// for the whole test, so the count starts at `2`. That is what makes "exactly
+/// once" observable: the count saturates at zero, so with a lone guard a double
+/// release reads `1 -> 0 -> 0`, which is the same trace as a single release.
+/// From `2` an extra release lands on `0` and shows up as the count coming back
+/// for a request that is still running.
 #[tokio::test]
 async fn a_counted_stream_returns_its_count_once_when_the_relay_ends() {
     let mut tracker = Tracker::new(0.3, 0.5);
     let idx = tracker.register();
+    // Held until the end of the test: this request is never finished with, so
+    // the count can only ever come down by one, and it must stop at one.
+    let _another_request = tracker.dispatch(idx);
     let chunks: Vec<Result<Frame<Bytes>, Infallible>> =
         vec![Ok(Frame::data(Bytes::from_static(b"data: a\n\n")))];
     let mut counted = Counted {
@@ -251,12 +261,12 @@ async fn a_counted_stream_returns_its_count_once_when_the_relay_ends() {
     };
 
     assert!(counted.next().await.is_some());
-    assert_eq!(tracker.in_flight(idx), 1, "still relaying");
+    assert_eq!(tracker.in_flight(idx), 2, "both are still relaying");
 
     assert!(counted.next().await.is_none());
     assert_eq!(
         tracker.in_flight(idx),
-        0,
+        1,
         "the candidate is done with the request once its stream ends"
     );
 
@@ -265,8 +275,9 @@ async fn a_counted_stream_returns_its_count_once_when_the_relay_ends() {
     drop(counted);
     assert_eq!(
         tracker.in_flight(idx),
-        0,
-        "the count must be returned exactly once"
+        1,
+        "the count must be returned exactly once, and the other request is \
+         still in flight"
     );
 }
 

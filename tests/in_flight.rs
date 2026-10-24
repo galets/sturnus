@@ -274,11 +274,48 @@ where
     (text, failed)
 }
 
+/// Read both caller streams until one of them ends, discarding what they carry,
+/// and report whether a side ended on an error rather than cleanly.
+///
+/// For when the mock has let go of only some of the streams it was holding: a
+/// caller has to keep reading for its relay to run to the end and return its
+/// count, and `drain`ing the pair here would wait on the stream that is still
+/// deliberately held open.
+async fn drive_until_one_ends<S>(first: &mut S, second: &mut S) -> bool
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "neither stream ended within {SETTLE:?}"
+        );
+        tokio::select! {
+            next = first.next() => match next {
+                Some(Ok(_)) => {}
+                Some(Err(_)) => return true,
+                None => return false,
+            },
+            next = second.next() => match next {
+                Some(Ok(_)) => {}
+                Some(Err(_)) => return true,
+                None => return false,
+            },
+        }
+    }
+}
+
 /// Mock upstream that answers every request with an SSE stream and then holds
 /// it open: one chunk, then it waits for a permit from `release` before
 /// finishing the body. That hold is the window in which a request is provably
 /// in flight, and how the test chooses to end the request — caller hangs up, or
 /// the release comes — is up to the test.
+///
+/// A permit is spent on one stream and then forgotten, so `add_permits(n)`
+/// finishes exactly `n` of the streams that are waiting and leaves the rest
+/// held: a permit handed back to the semaphore as a stream finished would let
+/// one release finish every waiting stream, one after the other.
 async fn held_sse_upstream() -> (u16, Arc<Semaphore>, tokio::task::JoinHandle<()>) {
     let (listener, port) = common::bind().await;
     let release = Arc::new(Semaphore::new(0));
@@ -296,7 +333,10 @@ async fn held_sse_upstream() -> (u16, Arc<Semaphore>, tokio::task::JoinHandle<()
                 sse_head(&mut conn).await;
                 sse_chunk(&mut conn, "data: a\n\n").await;
                 // Held open until the test lets this one finish.
-                let _ = release.acquire().await;
+                let Ok(permit) = release.acquire().await else {
+                    return;
+                };
+                permit.forget();
                 sse_chunk(&mut conn, "data: z\n\n").await;
                 sse_end(&mut conn).await;
             });
@@ -497,6 +537,12 @@ async fn a_pinned_request_is_counted_too() {
 /// Two concurrent streams are two units of load, and each comes back on its
 /// own: a count that double counted, or a release that ran twice, would end
 /// this test somewhere other than `0`.
+///
+/// The middle of the test is the part that catches a double release. Only one of
+/// the two held streams is let go first, so the count must land on `1`: a
+/// release that ran twice has already taken the other request's count by then.
+/// Reading only the ends would miss it — the count saturates at `0`, so `2 -> 0
+/// -> 0` and `2 -> 1 -> 0` are the same story once both requests are done.
 #[tokio::test]
 async fn two_concurrent_streams_count_both_and_release_both() {
     let (port, release, upstream) = held_sse_upstream().await;
@@ -513,7 +559,17 @@ async fn two_concurrent_streams_count_both_and_release_both() {
     second_stream.next().await.unwrap().unwrap();
     wait_for_in_flight(&state, "test", 2).await;
 
-    release.add_permits(2);
+    // Let exactly one of the two upstream responses finish. The mock hands its
+    // permits to whichever request is waiting, so which side ends is not the
+    // test's to choose, and does not matter: both streams reach the same
+    // candidate, and one of them is still open either way.
+    release.add_permits(1);
+    let errored = drive_until_one_ends(&mut first_stream, &mut second_stream).await;
+    assert!(!errored, "the stream that ended, ended cleanly");
+    wait_for_in_flight(&state, "test", 1).await;
+
+    // ...and now the other one, which is what the count was still holding.
+    release.add_permits(1);
     let (_, failed_first) = drain(first_stream).await;
     let (_, failed_second) = drain(second_stream).await;
     assert!(!failed_first && !failed_second, "both streams end cleanly");
