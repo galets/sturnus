@@ -755,3 +755,88 @@ fn select_candidate_draws_from_the_weighted_schedule() {
         assert_eq!(picked.provider_name, scheduled.provider_name);
     }
 }
+
+// --- Reporting the schedule (`/status` and the routing debug line) ---------
+
+#[test]
+fn weighted_schedule_reports_the_effective_latency_it_weighted() {
+    // The latency `/status` shows must be the one the weight was derived from,
+    // so the schedule reports it instead of the caller recomputing the formula:
+    // effective latency is the latency EWMA over the success-rate EWMA, so one
+    // error at alpha 0.3 inflates a 200ms candidate to 200/0.7 ≈ 286ms while
+    // its latency EWMA stays 200ms.
+    let (candidates, tracker, _rr) = setup(&[("fast", "m1"), ("erroring", "m2"), ("cold", "m3")]);
+    for _ in 0..2 {
+        tracker.record_success(
+            candidates[0].stats_index,
+            LatencyMode::Streaming,
+            Duration::from_millis(100),
+        );
+        tracker.record_success(
+            candidates[1].stats_index,
+            LatencyMode::Streaming,
+            Duration::from_millis(200),
+        );
+    }
+    tracker.record_error(candidates[1].stats_index);
+
+    let schedule = weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+
+    assert_eq!(schedule.entries[0].effective_latency_ms, Some(100.0));
+    let erroring = schedule.entries[1]
+        .effective_latency_ms
+        .expect("a candidate with samples is warm");
+    assert!(
+        (erroring - 200.0 / (1.0 - 0.3)).abs() < 1e-9,
+        "errors inflate effective latency: {erroring}"
+    );
+    assert_eq!(
+        tracker
+            .stats(candidates[1].stats_index)
+            .ewma_ms(LatencyMode::Streaming),
+        200,
+        "…while the latency EWMA the endpoint shows next to it stays 200ms"
+    );
+    assert_eq!(schedule.entries[2].effective_latency_ms, None);
+}
+
+#[test]
+fn shares_are_zero_rather_than_nan_for_an_empty_total() {
+    // A zero total is unreachable through `weighted_schedule` — every entry
+    // keeps at least the probe floor — but `/status` renders these numbers, so
+    // the divide is guarded rather than trusted.
+    assert!(
+        !normalised_share(10, 0).is_nan(),
+        "a NaN would reach the endpoint"
+    );
+    assert_eq!(normalised_share(10, 0), 0.0);
+    assert_eq!(normalised_share(0, 0), 0.0);
+    assert!((normalised_share(10, 1000) - 0.01).abs() < 1e-12);
+}
+
+#[test]
+fn schedule_renders_every_share_for_the_debug_line() {
+    let (candidates, tracker, _rr) = setup(&[("groq", "llama-3.3-70b"), ("openai", "gpt-4o-mini")]);
+    tracker.record_success(
+        candidates[0].stats_index,
+        LatencyMode::Streaming,
+        Duration::from_millis(100),
+    );
+    tracker.record_success(
+        candidates[1].stats_index,
+        LatencyMode::Streaming,
+        Duration::from_millis(200),
+    );
+
+    let schedule = weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+    // 1000/1125 and 125/1125, i.e. 88.9% and 11.1%.
+    assert_eq!(
+        schedule.to_string(),
+        "groq/llama-3.3-70b=88.9% openai/gpt-4o-mini=11.1%"
+    );
+
+    // An alias with no candidates renders empty; it never reaches a pick.
+    let (no_candidates, tracker, _rr) = setup(&[]);
+    let empty = weighted_schedule(&no_candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+    assert_eq!(empty.to_string(), "");
+}

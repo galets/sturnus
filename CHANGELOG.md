@@ -23,6 +23,22 @@ their history lives in the git log and tags.
   list fails at startup rather than quietly disabling the gate, as does any entry
   that is blank, whitespace-padded, or non-ASCII — those are keys no client could
   ever present.
+- **`/status` now reports the router's arithmetic, not just its inputs.** Each
+  candidate carries `weight`, the integer weight it holds in its alias, and
+  `share`, the fraction of that alias's traffic it should be getting right now,
+  next to the `effective_latency_ms` both were derived from — under
+  `routing.streaming` and `routing.nonstreaming`, beside the latency EWMAs and
+  error rate that were already there. So "why is this box getting nothing?" is a
+  curl rather than an inference from a log excerpt, and the common non-answer is
+  visible too: a `share` of ~1% is the probe floor keeping a bad box sampled,
+  never `0`. The numbers come from the same weighted schedule the picker draws
+  from, so the endpoint and the routing decision cannot drift apart. Candidates
+  reachable through several aliases are now listed once per alias, since a share
+  only means something relative to the candidates it competes with there. At
+  `debug` a routed request logs the alias, the candidate that won, and every
+  candidate's share; a request riding an `x-session-affinity` pin instead logs
+  that it bypassed the router, with the provider and model, so a pin is not
+  mistaken for a weighted decision.
 
 ### Changed
 

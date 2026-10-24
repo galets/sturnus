@@ -71,6 +71,10 @@ pub struct ScheduledCandidate<'a> {
     pub weight: usize,
     /// Normalised traffic share, `weight / total_weight`, in `0.0..=1.0`.
     pub share: f64,
+    /// Effective latency (ms per successful response) the weight was derived
+    /// from, including the guards applied to it. `None` while cold for this
+    /// mode, which is why a cold candidate's weight is a probe, not a ranking.
+    pub effective_latency_ms: Option<f64>,
 }
 
 /// The weighted schedule for one alias at one moment.
@@ -83,6 +87,28 @@ pub struct WeightedSchedule<'a> {
     pub entries: Vec<ScheduledCandidate<'a>>,
     /// Sum of every entry's weight; the modulus of the Weyl pick.
     pub total_weight: usize,
+}
+
+/// Every candidate's share on one line, e.g.
+/// `groq/llama-3.3-70b=88.9% openai/gpt-4o-mini=11.1%` — the shape the routing
+/// debug line wants. `Display` rather than a built `String` so
+/// `debug!(shares = %schedule)` costs nothing unless the callsite is enabled.
+impl std::fmt::Display for WeightedSchedule<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, entry) in self.entries.iter().enumerate() {
+            if i > 0 {
+                f.write_str(" ")?;
+            }
+            write!(
+                f,
+                "{}/{}={:.1}%",
+                entry.candidate.provider_name,
+                entry.candidate.model,
+                entry.share * 100.0
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// Compute the weighted schedule for `candidates` in `mode`.
@@ -149,20 +175,35 @@ pub fn weighted_schedule<'a>(
             candidate,
             weight,
             share: 0.0,
+            effective_latency_ms: *effective_latency,
         });
         total_weight += weight;
     }
 
     // Shares are only meaningful once the total is known.
-    #[allow(clippy::cast_precision_loss)]
     for entry in &mut entries {
-        entry.share = entry.weight as f64 / total_weight as f64;
+        entry.share = normalised_share(entry.weight, total_weight);
     }
 
     WeightedSchedule {
         entries,
         total_weight,
     }
+}
+
+/// `weight / total_weight`, guarding the divide.
+///
+/// A zero total is unreachable today — every entry keeps at least the probe
+/// floor — but these numbers are rendered by `/status` and the routing debug
+/// line now, so a `NaN` reaching an operator would be worse than a `0.0`.
+fn normalised_share(weight: usize, total_weight: usize) -> f64 {
+    if total_weight == 0 {
+        return 0.0;
+    }
+    // Both are small counts, so the f64 conversion is exact.
+    #[allow(clippy::cast_precision_loss)]
+    let (weight, total_weight) = (weight as f64, total_weight as f64);
+    weight / total_weight
 }
 
 /// Draw a pick from a previously computed [`WeightedSchedule`].
@@ -198,7 +239,9 @@ pub fn pick_from_schedule<'a>(
 ///
 /// Builds the schedule with [`weighted_schedule`] and draws from it with
 /// [`pick_from_schedule`], so routing consumes exactly the weights that are
-/// inspectable through the schedule seam.
+/// inspectable through the schedule seam. A caller that also reports those
+/// numbers (the proxy's debug line) calls the two seams itself rather than
+/// computing the schedule twice.
 pub fn select_candidate<'a>(
     alias: &str,
     candidates: &'a [ResolvedCandidate],

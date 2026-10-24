@@ -122,8 +122,9 @@ impl ModelMap {
         self.aliases.keys().map(|s| s.as_str()).collect()
     }
 
-    /// Iterate every (alias, candidate) pair, for status reporting and
-    /// metric initialisation.
+    /// Iterate every (alias, candidate) pair, for metric initialisation.
+    /// Reporting code that needs a whole alias at once (the routing schedule is
+    /// per alias) uses `alias_names` and `get` instead.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &ResolvedCandidate)> {
         self.aliases.iter().flat_map(|(alias, candidates)| {
             candidates

@@ -8,13 +8,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
-use tracing_subscriber::fmt::MakeWriter;
 
 use sturnus::metrics::Metrics;
 use sturnus::model_map::ModelMap;
@@ -23,49 +22,7 @@ use sturnus::server::{run_server, AppState, BufferBudget};
 use sturnus::tracker::Tracker;
 
 mod common;
-
-/// A `MakeWriter` that keeps every formatted log line in memory.
-#[derive(Clone, Default)]
-struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
-
-impl CapturedLogs {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-    }
-}
-
-impl std::io::Write for CapturedLogs {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for CapturedLogs {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-/// Run `body` under a debug-level subscriber that captures into `logs`.
-async fn capture_logs<F, T>(logs: CapturedLogs, body: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_ansi(false)
-        .with_writer(logs)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
-    body.await
-}
+use common::{capture_logs, wait_for_log, CapturedLogs};
 
 fn state_from_config(config_toml: &str) -> Arc<AppState> {
     sturnus::init_crypto();
@@ -120,24 +77,6 @@ fn start_server(state: Arc<AppState>) -> (std::net::SocketAddr, oneshot::Sender<
         Duration::from_secs(1),
     ));
     (addr, tx)
-}
-
-/// Poll the shared log buffer until `predicate` holds, up to `timeout`.
-async fn wait_for_log<F>(logs: &CapturedLogs, timeout: Duration, predicate: F) -> String
-where
-    F: Fn(&str) -> bool,
-{
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let text = logs.text();
-        if predicate(&text) {
-            return text;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("log line not seen within {timeout:?}; captured logs:\n{text}");
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
 }
 
 /// A caller that drops after sending only part of a request head: the peer

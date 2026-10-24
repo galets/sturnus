@@ -7,7 +7,6 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use hyper_util::server::graceful::GracefulShutdown;
-use std::collections::HashSet;
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -266,24 +265,37 @@ pub async fn handle_request(
     };
 
     let candidate = if let Some(c) = pinned {
+        // A pin bypasses the router entirely, so log it as a pin: at debug a
+        // pinned request must not read like a weighted decision it never made.
+        debug!(
+            alias = %alias,
+            provider = %c.provider_name,
+            model = %c.model,
+            mode = latency_mode.as_str(),
+            "session affinity pin honored, router bypassed"
+        );
         c
     } else {
-        match router::select_candidate(
-            &alias,
-            candidates,
-            &state.tracker,
-            &state.rr_state,
-            state.exploit_k,
-            latency_mode,
-        ) {
-            Some(c) => c,
-            None => {
-                return Ok(json_error(
-                    hyper::StatusCode::BAD_GATEWAY,
-                    &format!("no healthy candidate for model alias '{alias}'"),
-                ));
-            }
-        }
+        // The schedule is built here rather than inside the picker so the
+        // weights behind this choice can be logged: the same numbers `/status`
+        // reports, from the same seam.
+        let schedule =
+            router::weighted_schedule(candidates, &state.tracker, state.exploit_k, latency_mode);
+        let Some(c) = router::pick_from_schedule(&schedule, &alias, &state.rr_state) else {
+            return Ok(json_error(
+                hyper::StatusCode::BAD_GATEWAY,
+                &format!("no healthy candidate for model alias '{alias}'"),
+            ));
+        };
+        debug!(
+            alias = %alias,
+            provider = %c.provider_name,
+            model = %c.model,
+            mode = latency_mode.as_str(),
+            shares = %schedule,
+            "routing decision"
+        );
+        c
     };
 
     let stats_index = candidate.stats_index;
@@ -638,34 +650,83 @@ fn is_benign_disconnect(error: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
+/// One candidate's live routing numbers for one latency mode, taken straight
+/// from the schedule the picker consumes: what the router would do right now
+/// if a request of this mode arrived.
+fn routing_report(entry: &router::ScheduledCandidate<'_>) -> serde_json::Value {
+    serde_json::json!({
+        // `null` while cold: there is no measured latency to weigh yet, so the
+        // weight is a probe share rather than a ranking.
+        "effective_latency_ms": entry.effective_latency_ms,
+        "weight": entry.weight,
+        "share": entry.share,
+    })
+}
+
+/// `GET /status`: every candidate as the router currently sees it — its health
+/// (cold/warm/degraded), its measured latencies and error rate, and the weight
+/// and traffic share those numbers buy it in each alias that can use it, per
+/// latency mode. Weights come from the same [`router::weighted_schedule`] the
+/// picker draws from, so the reported numbers and the routing decision cannot
+/// drift apart.
+///
+/// A candidate reachable through several aliases appears once per alias, since
+/// its share is relative to the candidates it competes with there.
 fn build_status_response(state: &AppState) -> Response<BoxBody> {
+    // Aliases sorted so repeated curls diff cleanly; the map itself is a HashMap.
+    let mut aliases = state.model_map.alias_names();
+    aliases.sort_unstable();
+
     let mut candidates = Vec::new();
-    let mut seen = HashSet::new();
-
-    for (_alias, c) in state.model_map.iter() {
-        if !seen.insert(c.stats_index) {
+    for alias in aliases {
+        // `alias` came from this very map, so the lookup cannot miss.
+        let Some(group) = state.model_map.get(alias) else {
             continue;
-        }
-        let stats = state.tracker.stats(c.stats_index);
-        let streaming_ewma = stats.ewma_ms(LatencyMode::Streaming);
-        let nonstreaming_ewma = stats.ewma_ms(LatencyMode::NonStreaming);
-        let any_warm = streaming_ewma != u64::MAX || nonstreaming_ewma != u64::MAX;
-        let status = if !any_warm {
-            "cold"
-        } else if state.tracker.is_degraded(c.stats_index) {
-            "degraded"
-        } else {
-            "warm"
         };
+        let streaming = router::weighted_schedule(
+            group,
+            &state.tracker,
+            state.exploit_k,
+            LatencyMode::Streaming,
+        );
+        let nonstreaming = router::weighted_schedule(
+            group,
+            &state.tracker,
+            state.exploit_k,
+            LatencyMode::NonStreaming,
+        );
 
-        candidates.push(serde_json::json!({
-            "provider": c.provider_name,
-            "model": c.model,
-            "status": status,
-            "streaming_ewma_ms": (streaming_ewma != u64::MAX).then_some(streaming_ewma),
-            "nonstreaming_ewma_ms": (nonstreaming_ewma != u64::MAX).then_some(nonstreaming_ewma),
-            "error_rate": 1.0 - stats.success_rate(),
-        }));
+        // Both schedules walk the same slice, so their entries line up.
+        for (streaming_entry, nonstreaming_entry) in
+            streaming.entries.iter().zip(&nonstreaming.entries)
+        {
+            let candidate = streaming_entry.candidate;
+            let stats = state.tracker.stats(candidate.stats_index);
+            let streaming_ewma = stats.ewma_ms(LatencyMode::Streaming);
+            let nonstreaming_ewma = stats.ewma_ms(LatencyMode::NonStreaming);
+            let any_warm = streaming_ewma != u64::MAX || nonstreaming_ewma != u64::MAX;
+            let status = if !any_warm {
+                "cold"
+            } else if state.tracker.is_degraded(candidate.stats_index) {
+                "degraded"
+            } else {
+                "warm"
+            };
+
+            candidates.push(serde_json::json!({
+                "alias": alias,
+                "provider": candidate.provider_name,
+                "model": candidate.model,
+                "status": status,
+                "streaming_ewma_ms": (streaming_ewma != u64::MAX).then_some(streaming_ewma),
+                "nonstreaming_ewma_ms": (nonstreaming_ewma != u64::MAX).then_some(nonstreaming_ewma),
+                "error_rate": 1.0 - stats.success_rate(),
+                "routing": {
+                    "streaming": routing_report(streaming_entry),
+                    "nonstreaming": routing_report(nonstreaming_entry),
+                },
+            }));
+        }
     }
 
     let body = serde_json::json!({

@@ -1,4 +1,5 @@
-//! Shared raw-socket mock-upstream primitives for integration tests.
+//! Shared integration-test primitives: a raw-socket mock upstream, and an
+//! in-memory log capture for asserting what the proxy logged.
 //!
 //! Tests assert on the bytes the proxy puts on the wire, so the upstream is a
 //! dumb TCP peer rather than a real HTTP server that would re-canonicalize the
@@ -8,8 +9,12 @@
 // subset of these helpers, so unused-per-binary is expected.
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tracing_subscriber::fmt::MakeWriter;
 
 /// Bind an ephemeral loopback listener, returning it and its port.
 pub async fn bind() -> (TcpListener, u16) {
@@ -108,4 +113,71 @@ pub async fn write_ok_close(conn: &mut TcpStream, body: &str) {
 /// Write a JSON response with a custom status line (e.g. `"503 Service Unavailable"`).
 pub async fn write_status(conn: &mut TcpStream, status_line: &str, body: &str) {
     send(conn, status_line, body, false).await;
+}
+
+// ---------------------------------------------------------------------------
+// Log capture
+// ---------------------------------------------------------------------------
+
+/// A `MakeWriter` that keeps every formatted log line in memory.
+#[derive(Clone, Default)]
+pub struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+impl CapturedLogs {
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for CapturedLogs {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Run `body` under a debug-level subscriber that captures into `logs`. The
+/// subscriber is thread-local, so a test using this needs a current-thread
+/// runtime for the work it wants to observe.
+pub async fn capture_logs<F, T>(logs: CapturedLogs, body: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(logs)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    body.await
+}
+
+/// Poll the shared log buffer until `predicate` holds, up to `timeout`.
+pub async fn wait_for_log<F>(logs: &CapturedLogs, timeout: Duration, predicate: F) -> String
+where
+    F: Fn(&str) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let text = logs.text();
+        if predicate(&text) {
+            return text;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("log line not seen within {timeout:?}; captured logs:\n{text}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

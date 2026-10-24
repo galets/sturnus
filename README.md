@@ -180,7 +180,7 @@ Sidecar keys take precedence over any client-supplied `labels` keys with the sam
 | POST | `/v1/chat/completions` | Proxied to upstream (model alias resolved) |
 | POST | `/v1/embeddings` | Proxied to upstream (model alias resolved) |
 | GET | `/health` | Returns `{"status":"ok"}` |
-| GET | `/status` | Returns current streaming/non-streaming EWMAs, error rate, and status per candidate |
+| GET | `/status` | Per candidate: cold/warm/degraded state, latency EWMAs, error rate, and the weight and traffic share the router would assign right now |
 | GET | `/metrics` | Prometheus metrics (see below) |
 
 The `POST` proxy routes are served only on `listen`. The `GET` observability routes are served on `listen` and, when configured, on `metrics_listen`. When `api_keys` is configured, the `POST` routes additionally require `Authorization: Bearer <key>`; the observability routes never do.
@@ -202,6 +202,62 @@ Prometheus metrics on `/metrics`, all labelled by `alias`, `provider`, `model`:
 
 Connection failures are zero-initialised at startup so a missing series is never mistaken for "no errors".
 
+### Status
+
+`GET /status` answers "why is this box getting nothing?" in one curl, rather than as an inference from a log excerpt. Each candidate of each alias is listed with its health, what it has been measured doing, and what those numbers buy it in the router's schedule right now:
+
+```json
+{
+  "candidates": [
+    {
+      "alias": "fast",
+      "error_rate": 0.0,
+      "model": "llama-3.3-70b",
+      "nonstreaming_ewma_ms": 134,
+      "provider": "groq",
+      "routing": {
+        "nonstreaming": { "effective_latency_ms": 134.0, "share": 0.7581501137225171, "weight": 1000 },
+        "streaming":    { "effective_latency_ms": 131.0, "share": 0.774593338497289,  "weight": 1000 }
+      },
+      "status": "warm",
+      "streaming_ewma_ms": 131
+    },
+    {
+      "alias": "fast",
+      "error_rate": 0.0,
+      "model": "gpt-4o-mini",
+      "nonstreaming_ewma_ms": 201,
+      "provider": "openai",
+      "routing": {
+        "nonstreaming": { "effective_latency_ms": 201.0, "share": 0.22441243366186506, "weight": 296 },
+        "streaming":    { "effective_latency_ms": 200.0, "share": 0.21766072811773818, "weight": 281 }
+      },
+      "status": "warm",
+      "streaming_ewma_ms": 200
+    },
+    {
+      "alias": "fast",
+      "error_rate": 0.7599,
+      "model": "qwen3-32b",
+      "nonstreaming_ewma_ms": 113,
+      "provider": "local",
+      "routing": {
+        "nonstreaming": { "effective_latency_ms": 470.63723448563115, "share": 0.017437452615617893, "weight": 23 },
+        "streaming":    { "effective_latency_ms": null, "share": 0.0077459333849728895, "weight": 10 }
+      },
+      "status": "degraded",
+      "streaming_ewma_ms": null
+    }
+  ]
+}
+```
+
+- **`status`** — `cold` (no latency sample in either mode yet), `warm`, or `degraded` (its error-rate EWMA has passed `error_threshold`, which is also what breaks session-affinity pins to it).
+- **`routing.<mode>`** — the numbers a request of that mode is routed on, since streaming TTFC and non-streaming response time keep separate EWMAs. `weight` is `(best_effective / its_effective)^exploit_k` scaled so the best candidate in the alias gets 1000, `share` is that weight over the alias's total weight, and `effective_latency_ms` is the latency EWMA over the success-rate EWMA: the number the weight came from, so an erroring candidate's is larger than its latency EWMA (`null` while cold).
+- **A `share` near 0.01 is the probe floor, not starvation.** Every weight is floored at 1% of the best candidate's (`PROBE_FLOOR`), which is what keeps a broken box sampled and lets it win traffic back. A `share` of exactly 0 never happens; `local` above is at the floor in `streaming` (no successes there) and near it in `nonstreaming`.
+- **Weights are per alias.** A candidate reachable through several aliases appears once per alias, because its share is relative to whoever it competes with there.
+- The numbers come from the same weighted schedule the picker draws from, so `/status` and the routing decision cannot drift apart. They describe what the router would do *now*: a request riding an `x-session-affinity` pin bypasses the router entirely and follows none of it.
+
 ### Logging
 
 Structured logging via `tracing`: coloured text on a terminal (respecting `NO_COLOR`), newline-delimited JSON when piped or redirected. Set the format with `--log-format <auto|pretty|json>` (or `STURNUS_LOG_FORMAT`) and the level with `RUST_LOG` (default `sturnus=info`).
@@ -209,6 +265,12 @@ Structured logging via `tracing`: coloured text on a terminal (respecting `NO_CO
 Each request gets a span with a `request_id`; a client-supplied W3C `traceparent` propagates as `trace_id` and `parent_span_id` for cross-service correlation.
 
 A caller that hangs up mid-request (closing the write half or the whole connection) is normal traffic, not a fault: it is logged at `debug` with the caller's address and counted in `sturnus_client_disconnects_total`, while genuine connection faults (such as a failed response write) stay at `error`.
+
+At `debug` each routed request also logs the decision behind its `INFO routing request` line: the alias, the candidate that won, and every candidate's share of the alias in that request's latency mode — the same numbers `/status` reports:
+
+```text
+DEBUG routing decision alias=fast provider=groq model=llama-3.3-70b mode="nonstreaming" shares=groq/llama-3.3-70b=77.0% openai/gpt-4o-mini=21.3% local/qwen3-32b=1.7%
+```
 
 ## Session affinity
 
@@ -229,6 +291,8 @@ response = client.chat.completions.create(
 ```
 
 Fully stateless — works across pods with no shared state. The pin is honored until the pinned candidate's error-rate EWMA breaches `error_threshold` (at the default smoothing, roughly two consecutive errors), at which point the header is ignored and a new provider is selected — check the updated `x-session-affinity` in the response. Unknown or malformed headers fall back to normal routing.
+
+A honored pin bypasses the router completely, and says so at `debug` (`session affinity pin honored, router bypassed` with the alias, provider and model) rather than looking like the weighted `routing decision` a routed request logs.
 
 ## How routing works
 
