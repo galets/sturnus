@@ -15,6 +15,9 @@ pub struct Metrics {
     pub errors_total: IntCounterVec,
     /// Requests shed with 429 because the aggregate buffer budget was full.
     pub buffer_rejections_total: IntCounter,
+    /// Callers that hung up before their request completed. Benign: logged at
+    /// debug and counted here so the volume stays observable.
+    pub client_disconnects_total: IntCounter,
 }
 
 impl std::fmt::Debug for Metrics {
@@ -77,6 +80,12 @@ impl Metrics {
         )
         .expect("valid metric descriptor");
 
+        let client_disconnects_total = IntCounter::new(
+            "sturnus_client_disconnects_total",
+            "Callers that hung up before their request completed",
+        )
+        .expect("valid metric descriptor");
+
         registry
             .register(Box::new(requests_total.clone()))
             .expect("unique metric name");
@@ -92,6 +101,9 @@ impl Metrics {
         registry
             .register(Box::new(buffer_rejections_total.clone()))
             .expect("unique metric name");
+        registry
+            .register(Box::new(client_disconnects_total.clone()))
+            .expect("unique metric name");
 
         Self {
             registry,
@@ -100,6 +112,7 @@ impl Metrics {
             latency_seconds,
             errors_total,
             buffer_rejections_total,
+            client_disconnects_total,
         }
     }
 
@@ -139,12 +152,14 @@ mod tests {
         m.errors_total
             .with_label_values(&["fast", "groq", "llama-3"])
             .inc();
+        m.client_disconnects_total.inc();
 
         let output = String::from_utf8(m.encode().unwrap()).unwrap();
         assert!(output.contains("sturnus_requests_total"));
         assert!(output.contains("sturnus_ttfc_seconds"));
         assert!(output.contains("sturnus_latency_seconds"));
         assert!(output.contains("sturnus_errors_total"));
+        assert!(output.contains("sturnus_client_disconnects_total"));
         assert!(output.contains("alias=\"fast\""));
         assert!(output.contains("provider=\"openai\""));
         assert!(output.contains("status_code=\"200\""));

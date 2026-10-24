@@ -39,6 +39,17 @@ their history lives in the git log and tags.
   image's built-in path.
 - The config path actually loaded is logged at startup.
 
+### Fixed
+
+- **Benign caller disconnects no longer log at ERROR.** A caller that hangs up
+  mid-request now appears at `debug` with its address and in the new
+  `sturnus_client_disconnects_total` counter instead of filling the journal
+  with `connection closed before message completed`. The previous filter
+  inspected the error's source chain for an I/O error, which hyper's
+  incomplete-message error does not carry, so it never matched. Genuine
+  connection faults — a failed write while sending a response, for example —
+  still log at `error`.
+
 ## [5.3.0] - 2026-08-25
 
 ### Added

@@ -198,6 +198,7 @@ Prometheus metrics on `/metrics`, all labelled by `alias`, `provider`, `model`:
 | `sturnus_latency_seconds` | histogram | Non-streaming full response time (non-streaming requests only) |
 | `sturnus_errors_total` | counter | Transport failures that never produced a response (timeout, connect, DNS) |
 | `sturnus_buffer_rejections_total` | counter | Requests shed with `429` because the aggregate buffer budget was full (no per-alias labels) |
+| `sturnus_client_disconnects_total` | counter | Callers that hung up before their request completed (no per-alias labels). Benign: logged at debug, not ERROR |
 
 Connection failures are zero-initialised at startup so a missing series is never mistaken for "no errors".
 
@@ -206,6 +207,8 @@ Connection failures are zero-initialised at startup so a missing series is never
 Structured logging via `tracing`: coloured text on a terminal (respecting `NO_COLOR`), newline-delimited JSON when piped or redirected. Set the format with `--log-format <auto|pretty|json>` (or `STURNUS_LOG_FORMAT`) and the level with `RUST_LOG` (default `sturnus=info`).
 
 Each request gets a span with a `request_id`; a client-supplied W3C `traceparent` propagates as `trace_id` and `parent_span_id` for cross-service correlation.
+
+A caller that hangs up mid-request (closing the write half or the whole connection) is normal traffic, not a fault: it is logged at `debug` with the caller's address and counted in `sturnus_client_disconnects_total`, while genuine connection faults (such as a failed response write) stay at `error`.
 
 ## Session affinity
 

@@ -112,6 +112,7 @@ fn access_denied() -> Response<BoxBody> {
 pub async fn handle_request(
     mut req: Request<hyper::body::Incoming>,
     state: Arc<AppState>,
+    remote: std::net::SocketAddr,
 ) -> Result<Response<BoxBody>, Infallible> {
     let path = req.uri().path().to_string();
     let method = req.method().clone();
@@ -188,7 +189,14 @@ pub async fn handle_request(
             ));
         }
         Err(e) => {
-            warn!("failed to read request body: {e}");
+            // A caller that hangs up while uploading is not a fault: its EOF
+            // arrives here wrapped in hyper's "error reading a body" error.
+            if is_benign_disconnect(e.as_ref()) {
+                state.metrics.client_disconnects_total.inc();
+                debug!(remote = %remote, "client disconnected while sending the request body");
+            } else {
+                warn!("failed to read request body: {e}");
+            }
             return Ok(json_error(
                 hyper::StatusCode::BAD_REQUEST,
                 "failed to read request body",
@@ -548,6 +556,9 @@ pub async fn run_server_with_role(
                 };
                 let io = TokioIo::new(stream);
                 let state = state.clone();
+                // The connection task needs the metrics registry after the
+                // service closure takes `state`.
+                let conn_state = state.clone();
 
                 let conn = http1::Builder::new()
                     .serve_connection(io, service_fn(move |req| {
@@ -555,7 +566,9 @@ pub async fn run_server_with_role(
                         async move {
                             let span = crate::trace::request_span(req.headers());
                             match role {
-                                ServerRole::Full => handle_request(req, state).instrument(span).await,
+                                ServerRole::Full => {
+                                    handle_request(req, state, remote).instrument(span).await
+                                }
                                 ServerRole::Observability => {
                                     handle_observability_request(req, state).instrument(span).await
                                 }
@@ -567,19 +580,10 @@ pub async fn run_server_with_role(
 
                 tokio::spawn(async move {
                     if let Err(e) = conn.await {
-                        let is_disconnect = std::error::Error::source(&e)
-                            .and_then(|src| src.downcast_ref::<std::io::Error>())
-                            .map_or(false, |io_err| {
-                                matches!(
-                                    io_err.kind(),
-                                    std::io::ErrorKind::ConnectionReset
-                                        | std::io::ErrorKind::ConnectionAborted
-                                        | std::io::ErrorKind::NotConnected
-                                        | std::io::ErrorKind::BrokenPipe
-                                )
-                            });
-
-                        if !is_disconnect {
+                        if is_benign_disconnect(&e) {
+                            conn_state.metrics.client_disconnects_total.inc();
+                            debug!(remote = %remote, "client disconnected before the request completed");
+                        } else {
                             error!(remote = %remote, error = %e, "connection error");
                         }
                     }
@@ -604,6 +608,34 @@ pub async fn run_server_with_role(
             warn!(timeout_secs = shutdown_timeout.as_secs(), "drain timeout reached, dropping remaining connections");
         }
     }
+}
+
+/// Whether a connection error is a caller hanging up rather than a fault.
+///
+/// hyper reports EOF in the middle of a message as an `IncompleteMessage`
+/// error. That marker may sit at the top of the chain (a mid-head EOF on the
+/// connection or a half-close while the response is written) or arrive
+/// wrapped as an `UnexpectedEof` I/O error (a request body that stops short
+/// of its declared length). Neither carries a connection fault, so both are
+/// the normal shape of a caller that hangs up mid-request, shuts down its
+/// write half while waiting for the response, or exits while a response is in
+/// flight. Real faults — a failed write, a reset while sending a response —
+/// surface as other I/O or protocol errors and stay at ERROR.
+fn is_benign_disconnect(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(err) = current {
+        let incomplete_message = err
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_incomplete_message);
+        let truncated_body = err
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof);
+        if incomplete_message || truncated_body {
+            return true;
+        }
+        current = err.source();
+    }
+    false
 }
 
 fn build_status_response(state: &AppState) -> Response<BoxBody> {
