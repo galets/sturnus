@@ -63,25 +63,44 @@ const MIN_SUCCESS_RATE: f64 = 1e-3;
 /// 2^64 / φ, the Weyl-sequence step. Odd, so `wrapping_mul` is a bijection.
 const WEYL_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// Pick a candidate for `alias` by proportional weighting.
+/// One candidate's place in a [`WeightedSchedule`].
+#[derive(Debug, Clone)]
+pub struct ScheduledCandidate<'a> {
+    pub candidate: &'a ResolvedCandidate,
+    /// Integer weight in `WEIGHT_RESOLUTION` units; never below the probe floor.
+    pub weight: usize,
+    /// Normalised traffic share, `weight / total_weight`, in `0.0..=1.0`.
+    pub share: f64,
+}
+
+/// The weighted schedule for one alias at one moment.
+///
+/// Computed independently of any pick so callers can inspect the weights and
+/// shares without consuming a tick. The pick path draws from this same
+/// schedule, keeping the reported numbers and the routing decision in sync.
+#[derive(Debug)]
+pub struct WeightedSchedule<'a> {
+    pub entries: Vec<ScheduledCandidate<'a>>,
+    /// Sum of every entry's weight; the modulus of the Weyl pick.
+    pub total_weight: usize,
+}
+
+/// Compute the weighted schedule for `candidates` in `mode`.
 ///
 /// Weights use *effective latency* — the latency EWMA over the success-rate
 /// EWMA, i.e. expected time per successful response. Each candidate gets
 /// traffic proportional to `(best_effective / its_effective)^k`, so slower
 /// or erroring candidates keep a small but never-zero share. That share
 /// doubles as the probe through which a recovered candidate wins traffic back.
-pub fn select_candidate<'a>(
-    alias: &str,
+///
+/// Pure: reads the tracker but does not advance the round-robin counter, so
+/// it can be called for observability without perturbing routing.
+pub fn weighted_schedule<'a>(
     candidates: &'a [ResolvedCandidate],
     tracker: &Tracker,
-    rr: &RoundRobinState,
     k: f64,
     mode: LatencyMode,
-) -> Option<&'a ResolvedCandidate> {
-    if candidates.is_empty() {
-        return None;
-    }
-
+) -> WeightedSchedule<'a> {
     // Effective latency (ms per successful response); None = cold for `mode`.
     let effective: Vec<Option<f64>> = candidates
         .iter()
@@ -105,8 +124,8 @@ pub fn select_candidate<'a>(
         .fold(f64::INFINITY, f64::min);
 
     // Floor at the probe share so no candidate starves.
-    let mut weighted: Vec<(&ResolvedCandidate, usize)> = Vec::with_capacity(candidates.len());
-    let mut total: usize = 0;
+    let mut entries: Vec<ScheduledCandidate<'a>> = Vec::with_capacity(candidates.len());
+    let mut total_weight: usize = 0;
     for (candidate, effective_latency) in candidates.iter().zip(&effective) {
         let raw_weight = match effective_latency {
             Some(latency) => (best / latency).powf(k),
@@ -126,25 +145,70 @@ pub fn select_candidate<'a>(
         let weight = (raw_weight * WEIGHT_RESOLUTION)
             .round()
             .max(WEIGHT_RESOLUTION * PROBE_FLOOR) as usize;
-        weighted.push((candidate, weight));
-        total += weight;
+        entries.push(ScheduledCandidate {
+            candidate,
+            weight,
+            share: 0.0,
+        });
+        total_weight += weight;
     }
 
-    // Golden-ratio Weyl sequence (n·2^64/φ): a deterministic stand-in for the
-    // uniform sample in weighted choice (cf. rand::distributions::WeightedIndex).
-    // Stays equidistributed even when modes subsample the shared counter.
+    // Shares are only meaningful once the total is known.
+    #[allow(clippy::cast_precision_loss)]
+    for entry in &mut entries {
+        entry.share = entry.weight as f64 / total_weight as f64;
+    }
+
+    WeightedSchedule {
+        entries,
+        total_weight,
+    }
+}
+
+/// Draw a pick from a previously computed [`WeightedSchedule`].
+///
+/// Golden-ratio Weyl sequence (n·2^64/φ): a deterministic stand-in for the
+/// uniform sample in weighted choice (cf. rand::distributions::WeightedIndex).
+/// Stays equidistributed even when modes subsample the shared counter.
+pub fn pick_from_schedule<'a>(
+    schedule: &WeightedSchedule<'a>,
+    alias: &str,
+    rr: &RoundRobinState,
+) -> Option<&'a ResolvedCandidate> {
+    // No tick is consumed for an empty schedule, matching the old early return.
+    if schedule.entries.is_empty() || schedule.total_weight == 0 {
+        return None;
+    }
+
     let spread = rr.next_tick(alias).wrapping_mul(WEYL_STEP);
     #[allow(clippy::cast_possible_truncation)]
-    let pos = ((u128::from(spread) * total as u128) >> 64) as usize;
+    let pos = ((u128::from(spread) * schedule.total_weight as u128) >> 64) as usize;
     let mut acc = 0;
-    for (c, w) in &weighted {
-        acc += *w;
+    for entry in &schedule.entries {
+        acc += entry.weight;
         if pos < acc {
-            return Some(c);
+            return Some(entry.candidate);
         }
     }
-    // pos < total guarantees a hit above; last is a safe fallback.
-    weighted.last().map(|(c, _)| *c)
+    // pos < total_weight guarantees a hit above; last is a safe fallback.
+    schedule.entries.last().map(|entry| entry.candidate)
+}
+
+/// Pick a candidate for `alias` by proportional weighting.
+///
+/// Builds the schedule with [`weighted_schedule`] and draws from it with
+/// [`pick_from_schedule`], so routing consumes exactly the weights that are
+/// inspectable through the schedule seam.
+pub fn select_candidate<'a>(
+    alias: &str,
+    candidates: &'a [ResolvedCandidate],
+    tracker: &Tracker,
+    rr: &RoundRobinState,
+    k: f64,
+    mode: LatencyMode,
+) -> Option<&'a ResolvedCandidate> {
+    let schedule = weighted_schedule(candidates, tracker, k, mode);
+    pick_from_schedule(&schedule, alias, rr)
 }
 
 #[cfg(test)]

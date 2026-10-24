@@ -541,3 +541,217 @@ fn does_not_over_route_to_a_load_dependent_upstream() {
         "openai should be used only while gemini is throttled, got {overrouting:.3}"
     );
 }
+
+const ALL_COLD: &str = concat!(
+    "ababaababbabaababbababbabaababbabaababaababbabaababbababbabaabab",
+    "babaababaababbabaababbabaababaababbabaababbababbabaababbabaababa",
+    "ababbabaababbababbabaababbabaababbababbabaababbabaababaababbabaa",
+    "babbababbabaababbabaababaababbabaababbabaababaababbabaababbababb",
+);
+
+const MIXED_COLD: &str = concat!(
+    "aaabaaaabaaaaaaabaaaabaabaaaabaaaaaaabaaaabaabaaaabaaaabaabaaaab",
+    "aaaaaaabaaaabaabaaaabaaaaaaabaaaabaabaaaabaaaabaabaaaabaaaaaaaba",
+    "aaabaabaaaabaaaabaabaaaabaaaaaaabaaaabaabaaaabaaaaaaabaaaabaabaa",
+    "aabaaaabaabaaaabaaaaaaabaaaabaabaaaabaaaaaaabaaaabaabaaaabaaaaba",
+);
+
+const FLOORED: &str = concat!(
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabaaaaaaaa",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaaaaaaaabaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+);
+
+const DEGRADED: &str = concat!(
+    "aaaaaaaabaaaaaaaaaaaabaaaaaaabaaaaaaaaaaaabaaaaaaabaaaabaaaaaaab",
+    "aaaaaaaaaaaabaaaaaaabaaaaaaaaaaaabaaaaaaaaaaaabaaaaaaabaaaaaaaaa",
+    "aaabaaaaaaabaaaabaaaaaaabaaaaaaaaaaaabaaaaaaabaaaaaaaaaaaabaaaaa",
+    "aabaaaabaaaaaaabaaaaaaaaaaaabaaaaaaabaaaaaaaaaaaabaaaaaaaaaaaaba",
+);
+
+// --- Weighted schedule seam ------------------------------------------------
+
+/// The fixed golden sequences below were captured from the implementation
+/// immediately before the schedule/pick split. Each character is one pick:
+/// `a` for the first/healthy candidate, `b` for the second. They must keep
+/// matching exactly — the extraction is a pure refactor.
+fn golden_trace(
+    candidates: &[ResolvedCandidate],
+    tracker: &Tracker,
+    rr: &RoundRobinState,
+    mode: LatencyMode,
+) -> String {
+    (0..256)
+        .map(|_| {
+            let picked =
+                select_candidate("test", candidates, tracker, rr, EXPLOIT_K, mode).unwrap();
+            match picked.provider_name.as_str() {
+                "a" | "warm" | "good" => 'a',
+                "b" | "cold" | "bad" => 'b',
+                other => panic!("unexpected provider {other}"),
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn golden_picks_are_stable_across_the_schedule_seam() {
+    // All cold: equal weights walk the aliases alternately.
+    let (candidates, tracker, rr) = setup(&[("a", "m1"), ("b", "m2")]);
+    assert_eq!(
+        golden_trace(&candidates, &tracker, &rr, LatencyMode::Streaming),
+        ALL_COLD,
+        "all-cold picks changed"
+    );
+
+    // Mixed cold: the cold candidate probes at a quarter of the warm rate.
+    let (candidates, tracker, rr) = setup(&[("warm", "m1"), ("cold", "m2")]);
+    tracker.record_success(
+        candidates[0].stats_index,
+        LatencyMode::Streaming,
+        Duration::from_millis(100),
+    );
+    assert_eq!(
+        golden_trace(&candidates, &tracker, &rr, LatencyMode::Streaming),
+        MIXED_COLD,
+        "cold-probe picks changed"
+    );
+
+    // Floored: a hard-failing candidate sits at the probe floor but is still
+    // scheduled often enough to be sampled.
+    let (candidates, tracker, rr) = setup(&[("good", "m1"), ("bad", "m2")]);
+    for candidate in &candidates {
+        tracker.record_success(
+            candidate.stats_index,
+            LatencyMode::Streaming,
+            Duration::from_millis(100),
+        );
+    }
+    for _ in 0..50 {
+        tracker.record_error(candidates[1].stats_index);
+    }
+    assert!(tracker.is_degraded(candidates[1].stats_index));
+    assert!(!tracker
+        .stats(candidates[1].stats_index)
+        .is_cold(LatencyMode::Streaming));
+    assert_eq!(
+        golden_trace(&candidates, &tracker, &rr, LatencyMode::Streaming),
+        FLOORED,
+        "probe-floor picks changed"
+    );
+
+    // Degraded: two errors push it over the error threshold, but its share
+    // stays proportional rather than collapsing to the floor.
+    let (candidates, tracker, rr) = setup(&[("a", "m1"), ("b", "m2")]);
+    for candidate in &candidates {
+        tracker.record_success(
+            candidate.stats_index,
+            LatencyMode::Streaming,
+            Duration::from_millis(100),
+        );
+    }
+    for _ in 0..2 {
+        tracker.record_error(candidates[1].stats_index);
+    }
+    assert!(tracker.is_degraded(candidates[1].stats_index));
+    assert_eq!(
+        golden_trace(&candidates, &tracker, &rr, LatencyMode::Streaming),
+        DEGRADED,
+        "degraded-share picks changed"
+    );
+}
+
+#[test]
+fn weighted_schedule_reports_weight_and_normalised_share() {
+    let (candidates, tracker, _rr) = setup(&[("fast", "m1"), ("slow", "m2")]);
+    tracker.record_success(
+        candidates[0].stats_index,
+        LatencyMode::Streaming,
+        Duration::from_millis(100),
+    );
+    tracker.record_success(
+        candidates[1].stats_index,
+        LatencyMode::Streaming,
+        Duration::from_millis(200),
+    );
+
+    let schedule = weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+
+    assert_eq!(schedule.entries.len(), 2);
+    assert_eq!(schedule.total_weight, 1125);
+    assert_eq!(schedule.entries[0].candidate.provider_name, "fast");
+    assert_eq!(schedule.entries[0].weight, 1000);
+    assert_eq!(schedule.entries[1].candidate.provider_name, "slow");
+    assert_eq!(schedule.entries[1].weight, 125);
+    assert!((schedule.entries[0].share - 1000.0 / 1125.0).abs() < 1e-12);
+    assert!((schedule.entries[1].share - 125.0 / 1125.0).abs() < 1e-12);
+    let share_sum: f64 = schedule.entries.iter().map(|entry| entry.share).sum();
+    assert!((share_sum - 1.0).abs() < 1e-12);
+}
+
+#[test]
+fn weighted_schedule_applies_cold_and_probe_floor_weights() {
+    let (candidates, tracker, _rr) = setup(&[("warm", "m1"), ("cold", "m2"), ("failing", "m3")]);
+    tracker.record_success(
+        candidates[0].stats_index,
+        LatencyMode::Streaming,
+        Duration::from_millis(100),
+    );
+    tracker.record_success(
+        candidates[2].stats_index,
+        LatencyMode::Streaming,
+        Duration::from_millis(100),
+    );
+    for _ in 0..50 {
+        tracker.record_error(candidates[2].stats_index);
+    }
+
+    let schedule = weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+
+    assert!(tracker
+        .stats(candidates[1].stats_index)
+        .is_cold(LatencyMode::Streaming));
+    assert_eq!(schedule.entries[0].weight, 1000, "warm reference weight");
+    assert_eq!(schedule.entries[1].weight, 250, "cold probe weight");
+    assert_eq!(schedule.entries[2].weight, 10, "hard-failing weight floor");
+    assert_eq!(schedule.total_weight, 1260);
+    assert!(
+        (schedule.entries[2].share - 10.0 / 1260.0).abs() < 1e-12,
+        "the floored candidate must report its ~1% share"
+    );
+}
+
+#[test]
+fn select_candidate_draws_from_the_weighted_schedule() {
+    let (candidates, tracker, rr) = setup(&[("fast", "m1"), ("slow", "m2")]);
+    tracker.record_success(
+        candidates[0].stats_index,
+        LatencyMode::Streaming,
+        Duration::from_millis(100),
+    );
+    tracker.record_success(
+        candidates[1].stats_index,
+        LatencyMode::Streaming,
+        Duration::from_millis(200),
+    );
+
+    let schedule = weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+    let mut schedule_rr = RoundRobinState::new();
+    schedule_rr.register_alias("test".to_string());
+
+    for _ in 0..128 {
+        let picked = select_candidate(
+            "test",
+            &candidates,
+            &tracker,
+            &rr,
+            EXPLOIT_K,
+            LatencyMode::Streaming,
+        )
+        .unwrap();
+        let scheduled =
+            pick_from_schedule(&schedule, "test", &schedule_rr).expect("schedule is not empty");
+        assert_eq!(picked.provider_name, scheduled.provider_name);
+    }
+}
