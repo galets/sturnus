@@ -39,6 +39,18 @@ their history lives in the git log and tags.
   candidate's share; a request riding an `x-session-affinity` pin instead logs
   that it bypassed the router, with the provider and model, so a pin is not
   mistaken for a weighted decision.
+- **`routing.exploit_k` is documented next to the other routing knobs.** The key
+  was accepted and validated but appeared in neither the README's config block
+  nor `config.example.toml`, so the main lever for an underutilized candidate
+  had to be rediscovered by reading the weighting code. Both now carry it with
+  its 3.0 default and a share table — a 2x-slower, a 5x-slower and a
+  hard-failing candidate, at 3.0, 1.0 and 0.0 — every number derived from the
+  arithmetic the router runs, probe floor included, and pinned by a test
+  (`documented_share_table_matches_the_weighting`). The README also states the
+  sharpness-0 caveat: an even split that stops counting errors, so a
+  hard-failing candidate keeps half the alias's traffic, and what config
+  *cannot* do — disable or bound session affinity, set a per-candidate weight,
+  or move the probe floor and cold probe share.
 
 ### Changed
 

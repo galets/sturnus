@@ -153,6 +153,29 @@ exploit_k = -1.0
 }
 
 #[test]
+fn exploit_k_defaults_to_the_documented_sharpness() {
+    // README and config.example.toml document 3.0 as the default and tabulate
+    // traffic shares at it, and both say 0.0 is accepted as an even split.
+    let toml_str = r#"
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini" }]
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.routing.exploit_k, crate::router::EXPLOIT_K);
+    assert_eq!(config.routing.exploit_k, 3.0);
+    assert!(config.validate().is_ok());
+
+    let zero: Config =
+        toml::from_str(&format!("{toml_str}\n[routing]\nexploit_k = 0.0\n")).unwrap();
+    assert_eq!(zero.routing.exploit_k, 0.0);
+    assert!(zero.validate().is_ok(), "an even split is a legal choice");
+}
+
+#[test]
 fn timeout_explicit_values_override_defaults() {
     let toml_str = r#"
 [provider.openai]

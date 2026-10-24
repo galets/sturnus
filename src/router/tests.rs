@@ -722,6 +722,113 @@ fn weighted_schedule_applies_cold_and_probe_floor_weights() {
     );
 }
 
+/// The weight and share of the worse candidate in a two-candidate alias whose
+/// best candidate sits at 100ms: `failures` straight errors on top of one
+/// success at `latency_ms`, at sharpness `k`. One success leaves the
+/// success-rate EWMA at 1.0, so its effective latency is just `latency_ms`;
+/// 50 failures clamp that rate to `MIN_SUCCESS_RATE`, i.e. 1000x the reference.
+fn weight_and_share_of_worse_candidate(latency_ms: u64, failures: u32, k: f64) -> (usize, f64) {
+    let (candidates, tracker, _rr) = setup(&[("best", "m1"), ("worse", "m2")]);
+    tracker.record_success(
+        candidates[0].stats_index,
+        LatencyMode::Streaming,
+        Duration::from_millis(100),
+    );
+    tracker.record_success(
+        candidates[1].stats_index,
+        LatencyMode::Streaming,
+        Duration::from_millis(latency_ms),
+    );
+    for _ in 0..failures {
+        tracker.record_error(candidates[1].stats_index);
+    }
+    let schedule = weighted_schedule(&candidates, &tracker, k, LatencyMode::Streaming);
+    (schedule.entries[1].weight, schedule.entries[1].share)
+}
+
+#[track_caller]
+fn assert_row(actual: (usize, f64), weight: usize, share: f64) {
+    let (got_weight, got_share) = actual;
+    assert_eq!(got_weight, weight, "weight");
+    assert!(
+        (got_share - share).abs() < 1e-12,
+        "share {got_share} != expected {share}"
+    );
+}
+
+/// The share table in `README.md` and `config.example.toml`, row by row. Every
+/// number in it is `round(1000 * (best / its_effective)^k)` floored at 10, over
+/// the alias's total weight — floors included — so the docs cannot drift from
+/// the arithmetic the router runs.
+#[test]
+fn documented_share_table_matches_the_weighting() {
+    // 2x slower.
+    assert_row(
+        weight_and_share_of_worse_candidate(200, 0, EXPLOIT_K),
+        125,
+        125.0 / 1125.0,
+    );
+    assert_row(
+        weight_and_share_of_worse_candidate(200, 0, 1.0),
+        500,
+        500.0 / 1500.0,
+    );
+    assert_row(weight_and_share_of_worse_candidate(200, 0, 0.0), 1000, 0.5);
+    // 5x slower: at the default sharpness the raw 8 units are floored to 10.
+    assert_row(
+        weight_and_share_of_worse_candidate(500, 0, EXPLOIT_K),
+        10,
+        10.0 / 1010.0,
+    );
+    assert_row(
+        weight_and_share_of_worse_candidate(500, 0, 1.0),
+        200,
+        200.0 / 1200.0,
+    );
+    assert_row(weight_and_share_of_worse_candidate(500, 0, 0.0), 1000, 0.5);
+    // Hard-failing: effective latency clamps to 1000x the reference, so the
+    // floor carries it at k >= 1 and k = 0 hands it half the alias anyway.
+    assert_row(
+        weight_and_share_of_worse_candidate(100, 50, EXPLOIT_K),
+        10,
+        10.0 / 1010.0,
+    );
+    assert_row(
+        weight_and_share_of_worse_candidate(100, 50, 1.0),
+        10,
+        10.0 / 1010.0,
+    );
+    assert_row(weight_and_share_of_worse_candidate(100, 50, 0.0), 1000, 0.5);
+}
+
+/// At `k = 0` even the cold probe loses its success-rate scaling, since
+/// `rate^0` is 1: an erroring cold candidate keeps the whole
+/// `COLD_PROBE_WEIGHT` rather than backing off.
+#[test]
+fn zero_sharpness_flattens_the_cold_probe_too() {
+    let (candidates, tracker, _rr) = setup(&[("best", "m1"), ("cold", "m2")]);
+    tracker.record_success(
+        candidates[0].stats_index,
+        LatencyMode::Streaming,
+        Duration::from_millis(100),
+    );
+    for _ in 0..10 {
+        tracker.record_error(candidates[1].stats_index);
+    }
+
+    assert_eq!(
+        weighted_schedule(&candidates, &tracker, 0.0, LatencyMode::Streaming).entries[1].weight,
+        250,
+        "an erroring cold candidate must keep the full probe at k = 0"
+    );
+    assert!(
+        weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming).entries[1]
+            .weight
+            < 250,
+        "…while at the default sharpness it backs off"
+    );
+}
+
 #[test]
 fn select_candidate_draws_from_the_weighted_schedule() {
     let (candidates, tracker, rr) = setup(&[("fast", "m1"), ("slow", "m2")]);

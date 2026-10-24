@@ -76,9 +76,27 @@ code = [
 
 [routing]
 ewma_alpha = 0.3          # EWMA smoothing factor (higher = more reactive)
+exploit_k = 3.0            # exploit sharpness: how strongly the best candidate is preferred (see the table below)
 error_threshold = 0.5      # error-rate EWMA above which a session-affinity pin is broken (routing weights are unaffected)
 connect_timeout_secs = 10  # max seconds to establish upstream connection
 read_timeout_secs = 60     # max seconds between chunks before treating upstream as hung
+
+# exploit_k is the exponent in each candidate's weight:
+# round(1000 * (best_effective / its_effective)^exploit_k), floored at 10 units
+# (1% of the best candidate's), where effective latency is the latency EWMA
+# over the success-rate EWMA. A candidate's share of its alias is its weight
+# over the alias's total weight, so for two candidates it works out as:
+#
+#   worse candidate    k = 3.0 (default)   k = 1.0    k = 0.0
+#   2x slower          11.1%               33.3%      50%
+#   5x slower          1.0%                16.7%      50%
+#   hard-failing       1.0%                1.0%       50%
+#
+# Each 1.0% is the probe floor (10 units of 1010), not the formula's own
+# number. Raising the exponent favours the best candidate; lowering it spreads
+# traffic to an underutilized one. k = 0 raises every ratio to the power 0, so
+# the split is even and errors stop counting entirely: a hard-failing candidate
+# keeps half the alias's traffic. Values must be finite and >= 0.
 
 # Vertex billing labels: merged into outbound bodies for any vertex_ai
 # provider with `attribution = true` (add the flag to its vertex_ai

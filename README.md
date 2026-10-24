@@ -110,6 +110,7 @@ fast = [
 
 [routing]
 ewma_alpha = 0.3          # smoothing for the latency and success-rate EWMAs (higher = more reactive)
+exploit_k = 3.0            # exploit sharpness: how strongly the best candidate is preferred (0.0 = even split; see How routing works)
 error_threshold = 0.5      # error-rate EWMA above which a session-affinity pin is broken (routing weights are unaffected)
 ```
 
@@ -298,12 +299,34 @@ A honored pin bypasses the router completely, and says so at `debug` (`session a
 
 1. Client sends `POST /v1/chat/completions` with `"model": "fast"`.
 2. Sidecar looks up the `fast` alias and computes each candidate's **effective latency**: its latency EWMA divided by its success-rate EWMA. A candidate erroring with probability `p` needs ~`1/(1-p)` attempts per success, so errors inflate effective latency the same way slowness does.
-3. Each candidate is weighted by `(best_effective / its_effective)^k`, so the best gets the bulk of traffic and worse ones a shrinking-but-nonzero share. A deterministic low-discrepancy sequence (golden-ratio Weyl sequence) turns those weights into picks.
+3. Each candidate is weighted by `(best_effective / its_effective)^k` — `k` is `routing.exploit_k`, default 3.0 — so the best gets the bulk of traffic and worse ones a shrinking-but-nonzero share. A deterministic low-discrepancy sequence (golden-ratio Weyl sequence) turns those weights into picks.
 4. Because worse candidates always keep a small share, their EWMAs stay fresh — a provider that recovers (faster responses *or* errors stopping) wins traffic back automatically; a cold candidate (no latency data yet) probes at a quarter of the best candidate's rate, scaled by its success rate, until its first samples land.
 5. The `model` field is rewritten to the real model name, auth headers are set, and the request is forwarded.
 6. TTFC is measured at first chunk arrival and fed back into the EWMA; the response status (any non-2xx counts as an error, including upstream 4xx) feeds the success-rate EWMA.
 
 The best provider is exploited heavily while worse ones keep enough traffic to stay measured. A candidate's probe share shrinks with how bad it looks but is floored at 1%, so re-detecting a recovered provider costs at most ~100 requests — and during an outage at most ~1% of an alias's traffic is spent on the failing candidate.
+
+### Exploit sharpness: `routing.exploit_k`
+
+`k` is the one knob that changes how an alias's traffic is divided. It acts on the *ratio* of effective latencies, so it behaves identically whether candidates differ by 20ms or 2s. A candidate's share is its weight over its alias's total weight, where `weight = round(1000 * (best_effective / its_effective)^k)` floored at 10 units (1% of the best candidate's). For an alias of two candidates that means:
+
+| worse candidate | k = 3.0 (default) | k = 1.0 | k = 0.0 |
+|-----------------|-------------------|---------|---------|
+| 2x slower | 11.1% | 33.3% | 50% |
+| 5x slower | 1.0% | 16.7% | 50% |
+| hard-failing | 1.0% | 1.0% | 50% |
+
+Lower it when a healthy candidate is starved by a gap you consider noise; raise it when you want the best candidate to take as close to all of the traffic as the floor allows. The three 1.0% entries are the floor rather than the formula — their raw weights are 8, 1 and 0 units, each lifted to 10 — which is what guarantees every candidate stays measured.
+
+**k = 0 is an even split, not a safe one.** Raising every ratio to the power 0 makes each warm candidate weigh exactly 1000, so errors stop counting entirely: a hard-failing candidate keeps half the traffic of a two-candidate alias, and the probe floor never engages because no weight comes near it. The cold probe flattens with it, since `rate^0` is 1 — a candidate failing from the start still probes at the full quarter rate. What survives is outside the weighting: `error_threshold` still breaks `x-session-affinity` pins to that candidate and still reports it `degraded` on `/status`, but routing weights never consult the threshold.
+
+### What config cannot do
+
+The routing keys are `ewma_alpha`, `exploit_k` and `error_threshold`, alongside the timeouts and the body-size caps. There is no key for:
+
+- **Disabling or bounding session affinity.** A caller-supplied `x-session-affinity` pin is honored for as long as it stays under `error_threshold` — there is no turn limit, and no setting ignores the header. A handful of long-lived sessions can therefore hold one candidate at 100% of their own traffic however idle it looks to the router.
+- **A per-candidate weight.** A candidate is a `provider` and a `model`; shares come only from what each has been observed doing. To prefer a provider, make it faster or route it under its own alias.
+- **The probe floor and the cold probe share.** Both are fixed: 1% of the best candidate's weight, a quarter of its rate. They bound how much traffic an outage eats and how fast a recovery is noticed, so they are not a tuning surface.
 
 ## Docker
 
