@@ -151,6 +151,171 @@ fn slower_candidate_keeps_a_proportional_share() {
     );
 }
 
+// --- The queue term doing real work, and the reservation that lets it -----
+//
+// Both tests below go through [`select_and_dispatch`], the seam a real request
+// uses, because the point is not only what a pick scores but that it is the
+// same pick that spends the queue slot. A test that drove [`weighted_schedule`]
+// and `Tracker::dispatch` by hand could pass while the production path
+// double-counted or, worse, never counted at all.
+
+#[test]
+fn a_loaded_leader_yields_traffic_to_an_idle_slower_candidate() {
+    // The load-bearing case for queue awareness, and deliberately not a test
+    // over equal candidates: equal candidates are spread by the Weyl stride
+    // whatever the scores say, so they prove nothing about the queue term.
+    //
+    // Fast is 4x quicker, so its idle weight is 4^3 = 16 to 1 — 98.4% of
+    // traffic. Hold every stream open so the in-flight counts stay where the
+    // picks put them, and the leader's own queue has to be what stops it:
+    // weight (1/(0.1 + 0.1n))^3 against (1/0.4)^3. At n=3 the two are equal, so
+    // from there the idle candidate wins the majority, and it never has to wait
+    // for the EWMA to notice that the leader slowed down — the EWMA still
+    // reports the pristine 100 ms, because nothing has finished yet.
+    let (candidates, tracker, rr) = setup(&[("fast", "m1"), ("slow", "m2")]);
+    for c in &candidates {
+        tracker.record_success(
+            c.stats_index,
+            LatencyMode::Streaming,
+            Duration::from_millis(if c.provider_name == "fast" { 100 } else { 400 }),
+        );
+    }
+
+    // Warm the tick, then spend it on a throwaway request, so the burst below
+    // starts its walk from a point where the idle candidate is due.
+    for _ in 0..4 {
+        select_and_dispatch(
+            "test",
+            &candidates,
+            &tracker,
+            &rr,
+            3.0,
+            LatencyMode::Streaming,
+        )
+        .unwrap();
+    }
+
+    let n = 100;
+    let mut slow = 0;
+    // Held to the end of the scope: every pick must see the ones before it
+    // still occupying a slot, exactly as a burst at the connection limit does.
+    let mut held = Vec::with_capacity(n);
+    for _ in 0..n {
+        let dispatch = select_and_dispatch(
+            "test",
+            &candidates,
+            &tracker,
+            &rr,
+            3.0,
+            LatencyMode::Streaming,
+        )
+        .unwrap();
+        if dispatch.candidate.provider_name == "slow" {
+            slow += 1;
+        }
+        held.push(dispatch);
+    }
+    let slow_share = f64::from(slow) / n as f64;
+    assert!(
+        (0.20..=0.40).contains(&slow_share),
+        "a saturated 4x-faster leader should give the idle candidate its \
+         converged share (~0.25), got {slow_share:.2}"
+    );
+}
+
+#[test]
+fn concurrent_picks_reserve_before_the_next_one_scores() {
+    // What makes select-and-reserve one step rather than two, measured at the
+    // seam. Four identical candidates spread 8 requests 2/2/2/2 — but only if
+    // every pick sees the reservations before it. Serialized, the walk is fully
+    // determined: each pick advances the alias's tick by one, and a box that has
+    // been picked costs (1 + 1)^k = 8x what its idle twins cost, so the eight
+    // ticks land two per box exactly. That is why an exact split is a fair
+    // demand here and not a coin flip: a lopsided round means a pick scored
+    // in-flight counts that an earlier pick had already spent.
+    //
+    // Threads and barriers rather than tasks: the window this closes is a few
+    // instructions wide, so the test has to get the picks genuinely in flight at
+    // the same instant on different cores, not merely interleaved at await
+    // points. Rounds repeat because a given round only races if the wakeups
+    // really overlap; over twenty, a two-step select-and-reserve is caught every
+    // time.
+    const N: usize = 8;
+    const ROUNDS: usize = 20;
+    for round in 0..ROUNDS {
+        let (candidates, tracker, rr) =
+            setup(&[("p", "m1"), ("p", "m2"), ("p", "m3"), ("p", "m4")]);
+        let tracker = std::sync::Arc::new(tracker);
+        // Warm: all four have the same sample, so nothing is held back as cold.
+        for c in &candidates {
+            tracker.record_success(
+                c.stats_index,
+                LatencyMode::Streaming,
+                Duration::from_millis(100),
+            );
+        }
+        // Spend a stride on throwaway requests, so the burst starts its walk
+        // from a tick where every box is due.
+        for _ in 0..4 {
+            select_and_dispatch(
+                "test",
+                &candidates,
+                &tracker,
+                &rr,
+                3.0,
+                LatencyMode::Streaming,
+            )
+            .unwrap();
+        }
+
+        let go = std::sync::Barrier::new(N);
+        let in_flight = std::sync::Barrier::new(N);
+        let mut counts = vec![0usize; candidates.len()];
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..N)
+                .map(|_| {
+                    let tracker = std::sync::Arc::clone(&tracker);
+                    let go = &go;
+                    let in_flight = &in_flight;
+                    let candidates = &candidates;
+                    let rr = &rr;
+                    scope.spawn(move || {
+                        go.wait();
+                        let dispatch = select_and_dispatch(
+                            "test",
+                            candidates,
+                            &tracker,
+                            rr,
+                            3.0,
+                            LatencyMode::Streaming,
+                        )
+                        .unwrap();
+                        // The guard rides through this second barrier, so no
+                        // pick can score a slot that a finished thread has
+                        // already freed: every request of the round stays in
+                        // flight while any of them is still being placed.
+                        in_flight.wait();
+                        dispatch
+                    })
+                })
+                .collect();
+            let indices: Vec<usize> = handles
+                .into_iter()
+                .map(|h| h.join().unwrap().candidate.stats_index)
+                .collect();
+            for i in indices {
+                counts[i] += 1;
+            }
+        });
+        assert!(
+            counts.iter().all(|c| *c == 2),
+            "round {round}: 8 concurrent picks over 4 equal candidates should reserve two each, \
+             got {counts:?} — a pick scored the in-flight counts before an earlier pick had \
+             reserved"
+        );
+    }
+}
+
 #[test]
 fn alternating_modes_do_not_bias_the_weighted_walk() {
     // Modes share the alias tick counter, so each sees every other tick;

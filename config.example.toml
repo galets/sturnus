@@ -86,8 +86,10 @@ read_timeout_secs = 60     # max seconds between chunks before treating upstream
 # (1% of the best candidate's), where effective latency is the latency EWMA
 # over the success-rate EWMA, multiplied by (1 + in-flight requests) so a busy
 # candidate is scored on the wait it would impose. A candidate's share of its
-# alias is its weight over the alias's total weight, so for two waiting
-# candidates it works out as:
+# alias is its weight over the alias's total weight. Nothing is in flight in the
+# table below: the queue factor is 1 at in_flight = 0, so each row is the split
+# between two idle candidates waiting to be compared. One carrying n requests is
+# scored (1 + n)x slower than its row and its share shrinks until it drains:
 #
 #   worse candidate    k = 3.0 (default)   k = 1.0    k = 0.0
 #   2x slower          11.1%               33.3%      50%
@@ -98,7 +100,10 @@ read_timeout_secs = 60     # max seconds between chunks before treating upstream
 # number. Raising the exponent favours the best candidate; lowering it spreads
 # traffic to an underutilized one. k = 0 raises every ratio to the power 0, so
 # the split is even and errors stop counting entirely: a hard-failing candidate
-# keeps half the alias's traffic. Values must be finite and >= 0.
+# keeps half the alias's traffic. And because the queue adjustment lives inside
+# that ratio, k = 0 discards it too — a box carrying ten requests weighs exactly
+# what its idle twin does, and a burst lands wherever the tick says. Values must
+# be finite and >= 0.
 
 # Vertex billing labels: merged into outbound bodies for any vertex_ai
 # provider with `attribution = true` (add the flag to its vertex_ai

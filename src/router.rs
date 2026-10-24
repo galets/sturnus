@@ -143,10 +143,16 @@ impl std::fmt::Display for WeightedSchedule<'_> {
 /// keep a small but never-zero share. That share doubles as the probe
 /// through which a recovered candidate wins traffic back.
 ///
-/// Pure: reads the tracker but does not advance the round-robin counter, so
-/// it can be called for observability without perturbing routing. The
-/// in-flight counts it reads change underneath it only as requests are
-/// dispatched and released, which is exactly the signal it wants.
+/// Pure: reads the tracker but does not advance the round-robin counter and
+/// does not reserve anything, so it can be called for observability without
+/// perturbing routing — `/status` renders straight from it with no lock held.
+///
+/// What it reads is a snapshot: in-flight counts change underneath it as
+/// requests are dispatched and released. That is fine for a caller that is
+/// only *looking*. A caller that is about to *route* must not call it on its
+/// own, because the counts it scored are spent by the time it has picked: hold
+/// [`Tracker::lock_routing`] across schedule, pick and reserve, which is
+/// exactly what [`select_and_dispatch`] does.
 pub fn weighted_schedule<'a>(
     candidates: &'a [ResolvedCandidate],
     tracker: &Tracker,
@@ -180,7 +186,10 @@ pub fn weighted_schedule<'a>(
     //   (8x at k=3) against every still-idle candidate, so the next pick
     //   lands elsewhere; when every candidate carries one request they are
     //   equal again and the Weyl walk simply cycles. Concurrency, not the
-    //   EWMA's reaction time, is what reorders the candidates.
+    //   EWMA's reaction time, is what reorders the candidates — and only if
+    //   the first pick's request is already counted when the second scores,
+    //   which is the job of the atomic select-and-reserve in
+    //   [`select_and_dispatch`].
     // * Proportional share survives. The factor is applied per candidate
     //   inside the latency the existing ratio is taken on, so an all-idle
     //   alias multiplies every latency by 1.0 — an exact identity, the old
@@ -232,6 +241,14 @@ pub fn weighted_schedule<'a>(
             // (Dividing the weight by (1+n)^k is the latency-domain factor
             // (L·(1+n)) carried into the weight domain, where a cold
             // candidate has no L of its own to inflate.)
+            //
+            // The floor clips that factor short: at the default sharpness a
+            // cold 25% probe is 250 units idle, 31 with one request out, and
+            // at or below the 10-unit floor from two on. So the queue term
+            // backs a cold box off for its first request or two; past that its
+            // share is the floor's, and load stops mattering to it — the warm
+            // path has no such ceiling, which is why a busy candidate keeps
+            // yielding while a cold one settles at its probe rate.
             None => {
                 let stats = tracker.stats(candidate.stats_index);
                 let rate = stats.success_rate();
@@ -318,6 +335,13 @@ pub fn pick_from_schedule<'a>(
 /// inspectable through the schedule seam. A caller that also reports those
 /// numbers (the proxy's debug line) calls the two seams itself rather than
 /// computing the schedule twice.
+///
+/// This is the *scoring* half of a routing decision: it reserves nothing, so
+/// the counts it scored can be spent by someone else before the caller has
+/// dispatched. A request that is about to be dispatched goes through
+/// [`select_and_dispatch`] instead, and only a caller that has no reservation
+/// to make — the closed-loop simulation, and every test that wants the pick
+/// without the load — should want this one.
 pub fn select_candidate<'a>(
     alias: &str,
     candidates: &'a [ResolvedCandidate],
@@ -328,6 +352,65 @@ pub fn select_candidate<'a>(
 ) -> Option<&'a ResolvedCandidate> {
     let schedule = weighted_schedule(candidates, tracker, k, mode);
     pick_from_schedule(&schedule, alias, rr)
+}
+
+/// One request's routing decision: the candidate it belongs to, the load it
+/// reserved there, and the schedule it was picked from.
+#[derive(Debug)]
+pub struct Dispatch<'a> {
+    /// The candidate this request is now on its way to.
+    pub candidate: &'a ResolvedCandidate,
+    /// This request's unit of that candidate's in-flight count. Kept by the
+    /// caller until its response is over — `Tracker::dispatch` explains what
+    /// the count covers and how it comes back.
+    pub in_flight: crate::tracker::InFlightGuard,
+    /// The schedule the pick was drawn from, i.e. the queue-adjusted weights
+    /// and shares as they were *before* this request's own reservation. That
+    /// is the view the decision was made on, which is the one worth logging
+    /// and the one `/status` reports.
+    pub schedule: WeightedSchedule<'a>,
+}
+
+/// Score, pick and reserve a candidate for `alias` as one indivisible step,
+/// and return the request's in-flight guard along with its choice.
+///
+/// Indivisible is the whole point. Scoring reads each candidate's in-flight
+/// count and reserving adds to one of them; done as two steps, two requests
+/// picked at the same instant both read the same all-idle snapshot and both
+/// take the box the first one liked, so the queue adjustment that was supposed
+/// to spread the burst has already been evaluated and lost by the time the
+/// first reservation lands. On a multi-threaded runtime that window is not
+/// theoretical — it is the microseconds between a read and an increment, which
+/// is comfortably shorter than the gap between two arrivals an agent firing a
+/// burst produces.
+///
+/// So all three steps run inside [`Tracker::lock_routing`], a synchronous
+/// lock that is never held across an `await` — the section contains no `await`
+/// points at all, and the guard is dropped before this returns, so nothing
+/// here can keep the executor or a downstream call waiting on it. The lock
+/// lives on the tracker and covers the whole router rather than one alias;
+/// both choices are justified at the field, `Tracker::routing_lock`.
+///
+/// The pure seams stay pure: [`weighted_schedule`] and
+/// [`pick_from_schedule`] take no lock and reserve nothing, so `/status` keeps
+/// rendering the same arithmetic with no reservation and no contention.
+pub fn select_and_dispatch<'a>(
+    alias: &str,
+    candidates: &'a [ResolvedCandidate],
+    tracker: &Tracker,
+    rr: &RoundRobinState,
+    k: f64,
+    mode: LatencyMode,
+) -> Option<Dispatch<'a>> {
+    let held = tracker.lock_routing();
+    let schedule = weighted_schedule(candidates, tracker, k, mode);
+    let candidate = pick_from_schedule(&schedule, alias, rr)?;
+    let in_flight = tracker.reserve(candidate.stats_index, &held);
+    Some(Dispatch {
+        candidate,
+        in_flight,
+        schedule,
+    })
 }
 
 #[cfg(test)]

@@ -78,7 +78,10 @@ their history lives in the git log and tags.
   outstanding is weighted as if its effective latency were `(1 + n)` times
   larger — the classic first-come-first-served sojourn estimate, `n` queued
   latencies plus its own — so routing one request to a box immediately lowers
-  that box's score and the next pick goes elsewhere. A same-instant pair of
+  that box's score and the next pick goes elsewhere. Reading a candidate's
+  outstanding count and adding to it is one step rather than two: a pick scores
+  the alias and reserves its own place in it under one lock, so two requests
+  placed in the same instant never both see an idle box. A same-instant pair of
   requests against interchangeable boxes now splits one per box instead of
   queueing both on the current EWMA winner, while a genuinely slower box is
   still avoided rather than load-balanced to. The adjustment is the exact

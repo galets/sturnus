@@ -264,7 +264,12 @@ pub async fn handle_request(
         LatencyMode::NonStreaming
     };
 
-    let candidate = if let Some(c) = pinned {
+    // Where the request lands and the load it reserves there are one step.
+    // `select_and_dispatch` scores the candidates on their queues, picks, and
+    // counts this request against the winner without letting another pick read
+    // the counts in between — which is what makes a same-instant burst spread
+    // across an alias instead of piling onto its current favourite.
+    let (candidate, in_flight) = if let Some(c) = pinned {
         // A pin bypasses the router entirely, so log it as a pin: at debug a
         // pinned request must not read like a weighted decision it never made.
         debug!(
@@ -274,38 +279,45 @@ pub async fn handle_request(
             mode = latency_mode.as_str(),
             "session affinity pin honored, router bypassed"
         );
-        c
+        // It reserves all the same — `Tracker::dispatch` takes the routing
+        // lock a decision holds — so a pinned request is queued against its
+        // box and the next pick scores it there rather than seeing an idle
+        // candidate.
+        (c, state.tracker.dispatch(c.stats_index))
     } else {
-        // The schedule is built here rather than inside the picker so the
-        // weights behind this choice can be logged: the same numbers `/status`
-        // reports, from the same seam.
-        let schedule =
-            router::weighted_schedule(candidates, &state.tracker, state.exploit_k, latency_mode);
-        let Some(c) = router::pick_from_schedule(&schedule, &alias, &state.rr_state) else {
+        let Some(dispatch) = router::select_and_dispatch(
+            &alias,
+            candidates,
+            &state.tracker,
+            &state.rr_state,
+            state.exploit_k,
+            latency_mode,
+        ) else {
             return Ok(json_error(
                 hyper::StatusCode::BAD_GATEWAY,
                 &format!("no healthy candidate for model alias '{alias}'"),
             ));
         };
+        // The schedule this decision was drawn from is the pre-reservation
+        // view: the same queue-adjusted numbers `/status` reports, from the
+        // same seam, so the line and the endpoint cannot disagree.
         debug!(
             alias = %alias,
-            provider = %c.provider_name,
-            model = %c.model,
+            provider = %dispatch.candidate.provider_name,
+            model = %dispatch.candidate.model,
             mode = latency_mode.as_str(),
-            shares = %schedule,
+            shares = %dispatch.schedule,
             "routing decision"
         );
-        c
+        (dispatch.candidate, dispatch.in_flight)
     };
-
-    let stats_index = candidate.stats_index;
 
     // The request belongs to this candidate from here on, and the returned
     // guard is what gives that back: it is moved into the relay stream for a
     // streamed response and released when `forward_request` returns otherwise,
     // so every way a request can end also ends its count. `Tracker::dispatch`
     // explains why the count starts before the upstream is contacted.
-    let in_flight = state.tracker.dispatch(stats_index);
+    let stats_index = candidate.stats_index;
 
     info!(
         alias = %alias,
@@ -702,7 +714,10 @@ fn routing_report(entry: &router::ScheduledCandidate<'_>) -> serde_json::Value {
 /// requests it is serving right now, and the weight and traffic share those
 /// numbers buy it in each alias that can use it, per latency mode. Weights come
 /// from the same [`router::weighted_schedule`] the picker draws from, so the
-/// reported numbers and the routing decision cannot drift apart.
+/// reported numbers and the routing decision cannot drift apart. That call is
+/// made here without the routing lock on purpose: `/status` reserves nothing,
+/// so it has no in-flight counts to spend, and an operator's curl should not
+/// queue behind routing decisions (nor routing behind one) to get them.
 ///
 /// A candidate reachable through several aliases appears once per alias, since
 /// its share is relative to the candidates it competes with there.
