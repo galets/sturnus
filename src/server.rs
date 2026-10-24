@@ -684,11 +684,13 @@ fn is_benign_disconnect(error: &(dyn std::error::Error + 'static)) -> bool {
 
 /// One candidate's live routing numbers for one latency mode, taken straight
 /// from the schedule the picker consumes: what the router would do right now
-/// if a request of this mode arrived.
+/// if a request of this mode arrived. `effective_latency_ms` is the
+/// queue-adjusted one — the wait a request can expect, not the bare EWMA —
+/// so a curl during a burst shows the inflation the router is acting on.
 fn routing_report(entry: &router::ScheduledCandidate<'_>) -> serde_json::Value {
     serde_json::json!({
-        // `null` while cold: there is no measured latency to weigh yet, so the
-        // weight is a probe share rather than a ranking.
+        // `null` while cold: there is no measured latency to weigh (queue
+        // included), so the weight is a probe share rather than a ranking.
         "effective_latency_ms": entry.effective_latency_ms,
         "weight": entry.weight,
         "share": entry.share,

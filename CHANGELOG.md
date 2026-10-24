@@ -73,6 +73,30 @@ their history lives in the git log and tags.
 
 ### Changed
 
+- **Routing now scores a candidate on the wait a request can expect, not on
+  the latency it happened to measure last.** A candidate with `n` requests
+  outstanding is weighted as if its effective latency were `(1 + n)` times
+  larger — the classic first-come-first-served sojourn estimate, `n` queued
+  latencies plus its own — so routing one request to a box immediately lowers
+  that box's score and the next pick goes elsewhere. A same-instant pair of
+  requests against interchangeable boxes now splits one per box instead of
+  queueing both on the current EWMA winner, while a genuinely slower box is
+  still avoided rather than load-balanced to. The adjustment is the exact
+  identity at `in_flight = 0`, so an idle alias routes on measured latency
+  alone and the proportional-share property is untouched: the share table
+  (2x-slower 11.1% at the default sharpness, probe floor 1%) is the split of
+  a *waiting* alias, and the floor still applies after the adjustment, so a
+  candidate that is slow *and* busy keeps its shrinking-but-nonzero share.
+  Nothing oscillates either — the adjustment's only memory is the requests
+  themselves, and each response that finishes decays one step back toward the
+  idle arithmetic, so a box that served a burst wins its share smoothly back
+  as its queue drains. `/status` (`effective_latency_ms`) and the `debug`
+  `routing decision` line now render the queue-adjusted numbers, so the
+  inflation is visible on the very line that routed away from the busy box.
+  The per-request multiplier is fixed at one measured latency, like the probe
+  floor a property of how a box serialises work rather than a tuning surface;
+  `routing.exploit_k` remains the knob for how hard the resulting ratios are
+  exploited.
 - **Breaking (bare-metal):** the default config location is now
   `$HOME/.config/sturnus.toml` rather than `./config.toml` in the working
   directory. `--config` is unchanged and still overrides it. If `HOME` is

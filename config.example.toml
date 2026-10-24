@@ -84,8 +84,10 @@ read_timeout_secs = 60     # max seconds between chunks before treating upstream
 # exploit_k is the exponent in each candidate's weight:
 # round(1000 * (best_effective / its_effective)^exploit_k), floored at 10 units
 # (1% of the best candidate's), where effective latency is the latency EWMA
-# over the success-rate EWMA. A candidate's share of its alias is its weight
-# over the alias's total weight, so for two candidates it works out as:
+# over the success-rate EWMA, multiplied by (1 + in-flight requests) so a busy
+# candidate is scored on the wait it would impose. A candidate's share of its
+# alias is its weight over the alias's total weight, so for two waiting
+# candidates it works out as:
 #
 #   worse candidate    k = 3.0 (default)   k = 1.0    k = 0.0
 #   2x slower          11.1%               33.3%      50%

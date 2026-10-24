@@ -36,10 +36,10 @@ impl RoundRobinState {
 
 /// Default exploit sharpness (the `routing.exploit_k` default): traffic to
 /// each candidate is proportional to `(best_effective / its_effective)^k`,
-/// where effective latency folds the error rate in. Higher = stronger
-/// preference for the best. Scale-invariant (depends on the ratio, not
-/// absolute ms), so a fixed default generalises: a 2x-worse candidate gets
-/// ~1/8 the traffic, a 5x-worse one ~1/125.
+/// where effective latency folds the error rate and the outstanding load in.
+/// Higher = stronger preference for the best. Scale-invariant (depends on the
+/// ratio, not absolute ms), so a fixed default generalises: a 2x-worse
+/// candidate gets ~1/8 the traffic, a 5x-worse one ~1/125.
 pub const EXPLOIT_K: f64 = 3.0;
 
 /// Fastest candidate gets this many weight units; everyone else's weight is
@@ -60,6 +60,26 @@ const PROBE_FLOOR: f64 = 0.01;
 /// gets a finite (huge) value rather than a division by zero.
 const MIN_SUCCESS_RATE: f64 = 1e-3;
 
+/// Queue latency per outstanding request, in multiples of the candidate's
+/// own effective latency: a candidate serving `n` requests is scored as
+/// `effective * (1 + n * QUEUE_LATENCY_PER_REQUEST)`. Fixed at 1.0 — one
+/// queued request costs one measured latency of expected wait — not a config
+/// knob, for the same reason `PROBE_FLOOR` is not one: it is a property of
+/// how a box serialises work, not a traffic preference. The reasoning lives
+/// at the site the score is computed, in [`weighted_schedule`].
+const QUEUE_LATENCY_PER_REQUEST: f64 = 1.0;
+
+/// The queue multiplier for a candidate with `in_flight` requests
+/// outstanding: exactly `1.0` when idle, so an alias with nothing in flight
+/// routes on measured latency alone.
+fn queue_factor(in_flight: usize) -> f64 {
+    // A usize count of live requests is far below f64's exact-integer range.
+    #[allow(clippy::cast_precision_loss)]
+    {
+        1.0 + QUEUE_LATENCY_PER_REQUEST * in_flight as f64
+    }
+}
+
 /// 2^64 / φ, the Weyl-sequence step. Odd, so `wrapping_mul` is a bijection.
 const WEYL_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
 
@@ -72,8 +92,10 @@ pub struct ScheduledCandidate<'a> {
     /// Normalised traffic share, `weight / total_weight`, in `0.0..=1.0`.
     pub share: f64,
     /// Effective latency (ms per successful response) the weight was derived
-    /// from, including the guards applied to it. `None` while cold for this
-    /// mode, which is why a cold candidate's weight is a probe, not a ranking.
+    /// from, including the guards applied to it and the queue adjustment for
+    /// outstanding load — the wait a request routed here can expect. `None`
+    /// while cold for this mode, which is why a cold candidate's weight is a
+    /// probe, not a ranking.
     pub effective_latency_ms: Option<f64>,
 }
 
@@ -114,20 +136,66 @@ impl std::fmt::Display for WeightedSchedule<'_> {
 /// Compute the weighted schedule for `candidates` in `mode`.
 ///
 /// Weights use *effective latency* — the latency EWMA over the success-rate
-/// EWMA, i.e. expected time per successful response. Each candidate gets
-/// traffic proportional to `(best_effective / its_effective)^k`, so slower
-/// or erroring candidates keep a small but never-zero share. That share
-/// doubles as the probe through which a recovered candidate wins traffic back.
+/// EWMA, i.e. expected time per successful response, adjusted for the load
+/// already outstanding against each candidate (see the queue comment in the
+/// body). Each candidate gets traffic proportional to
+/// `(best_effective / its_effective)^k`, so slower or erroring candidates
+/// keep a small but never-zero share. That share doubles as the probe
+/// through which a recovered candidate wins traffic back.
 ///
 /// Pure: reads the tracker but does not advance the round-robin counter, so
-/// it can be called for observability without perturbing routing.
+/// it can be called for observability without perturbing routing. The
+/// in-flight counts it reads change underneath it only as requests are
+/// dispatched and released, which is exactly the signal it wants.
 pub fn weighted_schedule<'a>(
     candidates: &'a [ResolvedCandidate],
     tracker: &Tracker,
     k: f64,
     mode: LatencyMode,
 ) -> WeightedSchedule<'a> {
-    // Effective latency (ms per successful response); None = cold for `mode`.
+    // Effective latency (ms per successful response), then the queue
+    // adjustment; None = cold for `mode`.
+    //
+    // Why multiply by (1 + in_flight): the score a request should be routed
+    // on is the wait IT can expect, not the latency this box happened to
+    // measure last. A box with n requests outstanding is on track to spend
+    // ~n effective latencies delivering them, and an arrival that queues
+    // behind that work waits ~n·L before its own ~L of service — the classic
+    // FCFS sojourn estimate, (n + 1)·L. Real providers batch rather than
+    // serialise, so (1 + n) overstates the wait at high n; overstating is
+    // the safe direction (traffic leaves a hot box early and re-probes it as
+    // its guard drops), and it keeps the form scale-invariant like `k`
+    // itself: one queued request costs one measured latency whether that
+    // latency is 80ms or 8s.
+    //
+    // Why this shape and not an additive `L + n·C`: a constant per-request
+    // penalty C cannot be right at every scale — 500ms is noise on a 30s
+    // batch and catastrophe on a 20ms one — while a multiplicative factor
+    // composes with the ratio-of-latencies weighting the share table already
+    // rests on.
+    //
+    // Three properties this buys:
+    // * A burst spreads. N equal idle candidates weigh equal; the first pick
+    //   doubles its target's effective latency, dropping its weight by 2^k
+    //   (8x at k=3) against every still-idle candidate, so the next pick
+    //   lands elsewhere; when every candidate carries one request they are
+    //   equal again and the Weyl walk simply cycles. Concurrency, not the
+    //   EWMA's reaction time, is what reorders the candidates.
+    // * Proportional share survives. The factor is applied per candidate
+    //   inside the latency the existing ratio is taken on, so an all-idle
+    //   alias multiplies every latency by 1.0 — an exact identity, the old
+    //   arithmetic bit for bit — and a genuinely slower idle candidate keeps
+    //   the share the share table promises. A busy candidate's share shrinking
+    //   is not proportionality breaking, it is the load-dependent share the
+    //   ratio was always meant to express; the probe floor is applied after
+    //   the adjustment, so even slow *and* busy never goes to zero.
+    // * It drains without oscillation. The only memory is the requests
+    //   themselves: each response drops its guard (see `Tracker::dispatch`)
+    //   and decays the factor by one step toward the identity, so the
+    //   candidate that served a burst wins its share back smoothly as its
+    //   queue empties. Nothing integrates, nothing overshoots: at in_flight
+    //   0 the schedule is exactly the latency-only schedule, which is the
+    //   fixed point any idle alias sits at.
     let effective: Vec<Option<f64>> = candidates
         .iter()
         .map(|c| {
@@ -137,7 +205,9 @@ pub fn weighted_schedule<'a>(
             } else {
                 // Guarded against a 0ms EWMA.
                 #[allow(clippy::cast_precision_loss)]
-                Some(stats.ewma_ms(mode).max(1) as f64 / stats.success_rate().max(MIN_SUCCESS_RATE))
+                let measured =
+                    stats.ewma_ms(mode).max(1) as f64 / stats.success_rate().max(MIN_SUCCESS_RATE);
+                Some(measured * queue_factor(stats.in_flight()))
             }
         })
         .collect();
@@ -156,15 +226,21 @@ pub fn weighted_schedule<'a>(
         let raw_weight = match effective_latency {
             Some(latency) => (best / latency).powf(k),
             // Cold: fixed probe share (full when everyone is cold), scaled
-            // by success rate so erroring cold candidates back off too.
+            // by success rate so erroring cold candidates back off too, and
+            // by the same queue factor the warm path got — a cold candidate
+            // that is already serving requests is not a free probe slot.
+            // (Dividing the weight by (1+n)^k is the latency-domain factor
+            // (L·(1+n)) carried into the weight domain, where a cold
+            // candidate has no L of its own to inflate.)
             None => {
-                let rate = tracker.stats(candidate.stats_index).success_rate();
+                let stats = tracker.stats(candidate.stats_index);
+                let rate = stats.success_rate();
                 let base = if best.is_finite() {
                     COLD_PROBE_WEIGHT
                 } else {
                     1.0
                 };
-                base * rate.max(MIN_SUCCESS_RATE).powf(k)
+                base * rate.max(MIN_SUCCESS_RATE).powf(k) / queue_factor(stats.in_flight()).powf(k)
             }
         };
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

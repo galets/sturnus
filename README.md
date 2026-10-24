@@ -181,7 +181,7 @@ Sidecar keys take precedence over any client-supplied `labels` keys with the sam
 | POST | `/v1/chat/completions` | Proxied to upstream (model alias resolved) |
 | POST | `/v1/embeddings` | Proxied to upstream (model alias resolved) |
 | GET | `/health` | Returns `{"status":"ok"}` |
-| GET | `/status` | Per candidate: cold/warm/degraded state, latency EWMAs, error rate, and the weight and traffic share the router would assign right now |
+| GET | `/status` | Per candidate: cold/warm/degraded state, latency EWMAs, error rate, requests in flight, and the queue-adjusted weight and traffic share the router would assign right now |
 | GET | `/metrics` | Prometheus metrics (see below) |
 
 The `POST` proxy routes are served only on `listen`. The `GET` observability routes are served on `listen` and, when configured, on `metrics_listen`. When `api_keys` is configured, the `POST` routes additionally require `Authorization: Bearer <key>`; the observability routes never do.
@@ -219,8 +219,8 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
       "nonstreaming_ewma_ms": 134,
       "provider": "groq",
       "routing": {
-        "nonstreaming": { "effective_latency_ms": 134.0, "share": 0.7581501137225171, "weight": 1000 },
-        "streaming":    { "effective_latency_ms": 131.0, "share": 0.774593338497289,  "weight": 1000 }
+        "nonstreaming": { "effective_latency_ms": 402.0, "share": 0.10390689941812137, "weight": 125 },
+        "streaming":    { "effective_latency_ms": 393.0, "share": 0.11558669001751314, "weight": 132 }
       },
       "status": "warm",
       "streaming_ewma_ms": 131
@@ -233,8 +233,8 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
       "nonstreaming_ewma_ms": 201,
       "provider": "openai",
       "routing": {
-        "nonstreaming": { "effective_latency_ms": 201.0, "share": 0.22441243366186506, "weight": 296 },
-        "streaming":    { "effective_latency_ms": 200.0, "share": 0.21766072811773818, "weight": 281 }
+        "nonstreaming": { "effective_latency_ms": 201.0, "share": 0.8312551953449709, "weight": 1000 },
+        "streaming":    { "effective_latency_ms": 200.0, "share": 0.8756567425569177, "weight": 1000 }
       },
       "status": "warm",
       "streaming_ewma_ms": 200
@@ -247,8 +247,8 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
       "nonstreaming_ewma_ms": 113,
       "provider": "local",
       "routing": {
-        "nonstreaming": { "effective_latency_ms": 470.63723448563115, "share": 0.017437452615617893, "weight": 23 },
-        "streaming":    { "effective_latency_ms": null, "share": 0.0077459333849728895, "weight": 10 }
+        "nonstreaming": { "effective_latency_ms": 470.63723448563115, "share": 0.06483790523690773, "weight": 78 },
+        "streaming":    { "effective_latency_ms": null, "share": 0.008756567425569177, "weight": 10 }
       },
       "status": "degraded",
       "streaming_ewma_ms": null
@@ -258,9 +258,9 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
 ```
 
 - **`status`** — `cold` (no latency sample in either mode yet), `warm`, or `degraded` (its error-rate EWMA has passed `error_threshold`, which is also what breaks session-affinity pins to it).
-- **`in_flight`** — requests this candidate has outstanding right now, counted from the moment it is chosen (by the router or by an `x-session-affinity` pin) until its response ends, errors, or is dropped mid-flight, so the wait it covers includes connecting, uploading, TTFB and the stream itself. It is one count per box, so a candidate listed under several aliases shows the same number in every entry, and `0` means nothing is in flight. Read it against `share`: several requests queued on a candidate whose share says it should be getting a third of the alias is the congestion latency-only routing notices far too late.
-- **`routing.<mode>`** — the numbers a request of that mode is routed on, since streaming TTFC and non-streaming response time keep separate EWMAs. `weight` is `(best_effective / its_effective)^exploit_k` scaled so the best candidate in the alias gets 1000, `share` is that weight over the alias's total weight, and `effective_latency_ms` is the latency EWMA over the success-rate EWMA: the number the weight came from, so an erroring candidate's is larger than its latency EWMA (`null` while cold).
-- **A `share` near 0.01 is the probe floor, not starvation.** Every weight is floored at 1% of the best candidate's (`PROBE_FLOOR`), which is what keeps a broken box sampled and lets it win traffic back. A `share` of exactly 0 never happens; `local` above is at the floor in `streaming` (no successes there) and near it in `nonstreaming`.
+- **`in_flight`** — requests this candidate has outstanding right now, counted from the moment it is chosen (by the router or by an `x-session-affinity` pin) until its response ends, errors, or is dropped mid-flight, so the wait it covers includes connecting, uploading, TTFB and the stream itself. It is one count per box, so a candidate listed under several aliases shows the same number in every entry, and `0` means nothing is in flight. It is also an *input* to routing, not just a reading: each outstanding request adds one of the candidate's own effective latencies to the wait the next request can expect there, which is why `groq` above — the fastest box when idle — is currently worth only ~10% of the alias. As its two responses finish, the inflation decays request by request and its share walks back on its own.
+- **`routing.<mode>`** — the numbers a request of that mode is routed on, since streaming TTFC and non-streaming response time keep separate EWMAs. `weight` is `(best_effective / its_effective)^exploit_k` scaled so the best candidate in the alias gets 1000, `share` is that weight over the alias's total weight, and `effective_latency_ms` is the queue-adjusted latency the weight came from: the latency EWMA over the success-rate EWMA, times `(1 + in_flight)`. So it exceeds the latency EWMA both for erroring candidates (`local` in `nonstreaming`) and for busy ones (`groq`, at 3× its 131/134ms EWMAs because it carries two requests), and it is `null` while cold — nothing measured to adjust.
+- **A `share` near 0.01 is the probe floor, not starvation.** Every weight is floored at 1% of the best candidate's (`PROBE_FLOOR`), which is what keeps a broken box sampled and lets it win traffic back; the floor applies after the queue adjustment, so even a candidate that is slow *and* busy is never deleted from its own schedule. A `share` of exactly 0 never happens; `local` above sits at the floor in `streaming` (no successes there).
 - **Weights are per alias.** A candidate reachable through several aliases appears once per alias, because its share is relative to whoever it competes with there.
 - The numbers come from the same weighted schedule the picker draws from, so `/status` and the routing decision cannot drift apart. They describe what the router would do *now*: a request riding an `x-session-affinity` pin bypasses the router entirely and follows none of it.
 
@@ -272,10 +272,10 @@ Each request gets a span with a `request_id`; a client-supplied W3C `traceparent
 
 A caller that hangs up mid-request (closing the write half or the whole connection) is normal traffic, not a fault: it is logged at `debug` with the caller's address and counted in `sturnus_client_disconnects_total`, while genuine connection faults (such as a failed response write) stay at `error`.
 
-At `debug` each routed request also logs the decision behind its `INFO routing request` line: the alias, the candidate that won, and every candidate's share of the alias in that request's latency mode — the same numbers `/status` reports:
+At `debug` each routed request also logs the decision behind its `INFO routing request` line: the alias, the candidate that won, and every candidate's share of the alias in that request's latency mode — the same queue-adjusted numbers `/status` reports, so a busy candidate's shrunken share is visible on the very line that routed away from it:
 
 ```text
-DEBUG routing decision alias=fast provider=groq model=llama-3.3-70b mode="nonstreaming" shares=groq/llama-3.3-70b=77.0% openai/gpt-4o-mini=21.3% local/qwen3-32b=1.7%
+DEBUG routing decision alias=fast provider=openai model=gpt-4o-mini mode="nonstreaming" shares=groq/llama-3.3-70b=10.4% openai/gpt-4o-mini=83.1% local/qwen3-32b=6.5%
 ```
 
 ## Session affinity
@@ -304,16 +304,17 @@ A honored pin bypasses the router completely, and says so at `debug` (`session a
 
 1. Client sends `POST /v1/chat/completions` with `"model": "fast"`.
 2. Sidecar looks up the `fast` alias and computes each candidate's **effective latency**: its latency EWMA divided by its success-rate EWMA. A candidate erroring with probability `p` needs ~`1/(1-p)` attempts per success, so errors inflate effective latency the same way slowness does.
-3. Each candidate is weighted by `(best_effective / its_effective)^k` — `k` is `routing.exploit_k`, default 3.0 — so the best gets the bulk of traffic and worse ones a shrinking-but-nonzero share. A deterministic low-discrepancy sequence (golden-ratio Weyl sequence) turns those weights into picks.
-4. Because worse candidates always keep a small share, their EWMAs stay fresh — a provider that recovers (faster responses *or* errors stopping) wins traffic back automatically; a cold candidate (no latency data yet) probes at a quarter of the best candidate's rate, scaled by its success rate, until its first samples land.
-5. The `model` field is rewritten to the real model name, auth headers are set, and the request is forwarded.
-6. TTFC is measured at first chunk arrival and fed back into the EWMA; the response status (any non-2xx counts as an error, including upstream 4xx) feeds the success-rate EWMA.
+3. The effective latency is then adjusted for the load the candidate is already carrying: it is multiplied by `(1 + in_flight)`, its number of requests outstanding. A box with `n` requests on track to take one effective latency each is expected to make an arrival queue for ~`n` of them before serving its own — the FCFS sojourn estimate `(n + 1)·L` — so the router scores the wait a request can *expect*, not the latency it happened to measure last. Nothing in flight, nothing adjusted: at `in_flight = 0` this is exactly the previous arithmetic, and a same-instant pair of requests no longer piles onto one box, because the first pick halves that box's score against every idle twin.
+4. Each candidate is weighted by `(best_effective / its_effective)^k` — `k` is `routing.exploit_k`, default 3.0 — so the best gets the bulk of traffic and worse ones a shrinking-but-nonzero share. A deterministic low-discrepancy sequence (golden-ratio Weyl sequence) turns those weights into picks.
+5. Because worse candidates always keep a small share, their EWMAs stay fresh — a provider that recovers (faster responses *or* errors stopping) wins traffic back automatically; a cold candidate (no latency data yet) probes at a quarter of the best candidate's rate, scaled by its success rate, until its first samples land. A busy candidate recovers its share too, and much faster: each response that finishes takes one step off the queue adjustment, so the box that served a burst is attractive again as soon as its queue drains.
+6. The `model` field is rewritten to the real model name, auth headers are set, and the request is forwarded.
+7. TTFC is measured at first chunk arrival and fed back into the EWMA; the response status (any non-2xx counts as an error, including upstream 4xx) feeds the success-rate EWMA.
 
 The best provider is exploited heavily while worse ones keep enough traffic to stay measured. A candidate's probe share shrinks with how bad it looks but is floored at 1%, so re-detecting a recovered provider costs at most ~100 requests — and during an outage at most ~1% of an alias's traffic is spent on the failing candidate.
 
 ### Exploit sharpness: `routing.exploit_k`
 
-`k` is the one knob that changes how an alias's traffic is divided. It acts on the *ratio* of effective latencies, so it behaves identically whether candidates differ by 20ms or 2s. A candidate's share is its weight over its alias's total weight, where `weight = round(1000 * (best_effective / its_effective)^k)` floored at 10 units (1% of the best candidate's). For an alias of two candidates that means:
+`k` is the one knob that changes how an alias's traffic is divided. It acts on the *ratio* of effective latencies, so it behaves identically whether candidates differ by 20ms or 2s. A candidate's share is its weight over its alias's total weight, where `weight = round(1000 * (best_effective / its_effective)^k)` floored at 10 units (1% of the best candidate's). Effective latencies here are the queue-adjusted ones, so the table is the split of a *waiting* alias; a candidate carrying requests is scored `(1 + in_flight)`x slower than the table shows and its share shrinks accordingly until its responses finish. For an alias of two idle candidates the table is:
 
 | worse candidate | k = 3.0 (default) | k = 1.0 | k = 0.0 |
 |-----------------|-------------------|---------|---------|
@@ -332,6 +333,7 @@ The routing keys are `ewma_alpha`, `exploit_k` and `error_threshold`, alongside 
 - **Disabling or bounding session affinity.** A caller-supplied `x-session-affinity` pin is honored for as long as it stays under `error_threshold` — there is no turn limit, and no setting ignores the header. A handful of long-lived sessions can therefore hold one candidate at 100% of their own traffic however idle it looks to the router.
 - **A per-candidate weight.** A candidate is a `provider` and a `model`; shares come only from what each has been observed doing. To prefer a provider, make it faster or route it under its own alias.
 - **The probe floor and the cold probe share.** Both are fixed: 1% of the best candidate's weight, a quarter of its rate. They bound how much traffic an outage eats and how fast a recovery is noticed, so they are not a tuning surface.
+- **The queue adjustment.** A candidate with `n` requests outstanding is scored as if its effective latency were `(1 + n)` times larger — each in-flight request costs one measured latency of expected wait. That multiplier is fixed at 1.0 because it states how a box serialises work, not how much you like it; disabling it would put latency-only routing back, where the first request of a burst decides where the whole burst goes. `exploit_k` remains the knob for how hard the resulting ratios are exploited.
 
 ## Docker
 

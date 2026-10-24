@@ -474,9 +474,20 @@ impl Rng {
 /// is usually fast (~600ms) but episodically throttles to ~3000ms; candidate
 /// 1 ("openai") is a steady ~2000ms. Routes via the shipped `select_candidate`
 /// and feeds observed latency back. Returns (picks, gemini-throttled flags).
-/// Synchronous feedback is optimistic vs production, where concurrent
-/// in-flight picks route on a stale EWMA.
+///
+/// Requests now hold their in-flight count for their own duration, so a pick
+/// made while earlier requests are still outstanding sees their queues —
+/// the concurrency the router scores on since the queue adjustment. Time is
+/// quantised to ticks (one arrival per tick, a request held for
+/// `ceil(latency / TICK_MS)` of them): a 600ms box releases its count before
+/// the next arrival when it is healthy, so the idle baseline routes on
+/// latency alone, while a throttled 3000ms one stays visibly busy for three
+/// arrivals. The EWMA feedback itself is still synchronous at pick time;
+/// that lag, not this, is where production staleness lives.
 fn simulate_load_dependent() -> (Vec<usize>, Vec<bool>) {
+    /// One arrival per tick; latencies in ms, holds quantised to whole ticks.
+    const TICK_MS: u64 = 1_000;
+
     let mode = LatencyMode::NonStreaming;
     let mut tracker = Tracker::new(0.3, 0.5);
     let g = tracker.register();
@@ -495,8 +506,13 @@ fn simulate_load_dependent() -> (Vec<usize>, Vec<bool>) {
     let mut throttled = false;
     let mut picks = Vec::with_capacity(n);
     let mut flags = Vec::with_capacity(n);
+    // (tick its guard comes back, guard) for every request still outstanding.
+    let mut outstanding: Vec<(u64, crate::tracker::InFlightGuard)> = Vec::new();
 
-    for _ in 0..n {
+    for i in 0..n {
+        // Requests that finished before this arrival stop weighing on it.
+        outstanding.retain(|(release, _)| *release > i as u64);
+
         // Two-state Markov throttle: rare onset, ~50-tick average duration.
         throttled = if throttled {
             rng.unit() >= 0.02
@@ -517,6 +533,9 @@ fn simulate_load_dependent() -> (Vec<usize>, Vec<bool>) {
             mode,
             Duration::from_millis(latency),
         );
+        let hold_ticks = latency.div_ceil(TICK_MS).max(1);
+        let guard = tracker.dispatch(candidates[idx].stats_index);
+        outstanding.push((i as u64 + hold_ticks, guard));
         picks.push(idx);
     }
     (picks, flags)
@@ -528,6 +547,9 @@ fn does_not_over_route_to_a_load_dependent_upstream() {
     // throttles, traffic shifts to the slower one and back — it never herds
     // onto it beyond the actual throttle windows. Because the loser keeps a
     // small share, gemini stays sampled and its recovery is seen at once.
+    // With the queue adjustment this also holds the other way: while gemini
+    // is busy serving a throttle episode its own in-flight count moves the
+    // traffic, and it wins the share straight back as that queue drains.
     let (picks, flags) = simulate_load_dependent();
     #[allow(clippy::cast_precision_loss)]
     let overrouting = picks
@@ -540,6 +562,209 @@ fn does_not_over_route_to_a_load_dependent_upstream() {
         overrouting < 0.06,
         "openai should be used only while gemini is throttled, got {overrouting:.3}"
     );
+}
+
+// --- Queue-adjusted latency -------------------------------------------------
+
+/// One request per candidate, no exceptions: four equal candidates, four
+/// picks, each pick holding its in-flight guard before the next runs — the
+/// same-instant burst latency-only routing used to send to one box. The
+/// assertion is on the distribution (exactly one per candidate), not on
+/// "not all the same": two-on-one with two-untouched is still a queue.
+#[test]
+fn burst_of_picks_spreads_one_per_candidate() {
+    let (candidates, tracker, rr) = setup(&[("a", "m1"), ("b", "m2"), ("c", "m3"), ("d", "m4")]);
+    for candidate in &candidates {
+        tracker.record_success(
+            candidate.stats_index,
+            LatencyMode::Streaming,
+            Duration::from_millis(100),
+        );
+    }
+
+    // Guards live until the whole burst has been picked, mirroring the proxy:
+    // each request is dispatched (counted) as it is committed to its box.
+    let mut guards = Vec::new();
+    let mut counts = std::collections::HashMap::new();
+    for _ in 0..candidates.len() {
+        let picked = select_candidate(
+            "test",
+            &candidates,
+            &tracker,
+            &rr,
+            EXPLOIT_K,
+            LatencyMode::Streaming,
+        )
+        .unwrap();
+        guards.push(tracker.dispatch(picked.stats_index));
+        *counts.entry(picked.provider_name.clone()).or_insert(0usize) += 1;
+    }
+
+    for candidate in &candidates {
+        assert_eq!(
+            counts.get(&candidate.provider_name).copied(),
+            Some(1),
+            "every equal candidate should carry exactly one of the burst, got {counts:?}",
+        );
+    }
+    // The counts the picks saw were real: four boxes, one request each.
+    for candidate in &candidates {
+        assert_eq!(tracker.in_flight(candidate.stats_index), 1);
+    }
+}
+
+/// The burst property holds before any latency is measured at all: all four
+/// candidates cold, the probe share is the only weight, and one dispatch
+/// still drops a candidate's probe by `(1+1)^k` against the idle ones.
+#[test]
+fn a_cold_burst_spreads_across_cold_candidates() {
+    let (candidates, tracker, rr) = setup(&[("a", "m1"), ("b", "m2"), ("c", "m3"), ("d", "m4")]);
+
+    let mut guards = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..candidates.len() {
+        let picked = select_candidate(
+            "test",
+            &candidates,
+            &tracker,
+            &rr,
+            EXPLOIT_K,
+            LatencyMode::Streaming,
+        )
+        .unwrap();
+        assert!(
+            seen.insert(picked.provider_name.clone()),
+            "cold burst revisited {} before spreading",
+            picked.provider_name
+        );
+        guards.push(tracker.dispatch(picked.stats_index));
+    }
+}
+
+/// The adjustment is a function of the queue, not a grudge: dispatch three
+/// requests onto one of two equal candidates and its score drops; release
+/// the guards one at a time and the share walks monotonically back to the
+/// exactly-idle baseline — the candidate that served a burst is not
+/// starved, and at in_flight 0 the arithmetic is bit-identical to before.
+#[test]
+fn queue_adjustment_decays_as_in_flight_drains() {
+    let (candidates, tracker, _rr) = setup(&[("busy", "m1"), ("idle", "m2")]);
+    for candidate in &candidates {
+        tracker.record_success(
+            candidate.stats_index,
+            LatencyMode::Streaming,
+            Duration::from_millis(100),
+        );
+    }
+
+    let baseline = weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+    assert_eq!(baseline.entries[0].weight, 1000);
+    assert_eq!(baseline.entries[1].weight, 1000);
+
+    let guards: Vec<_> = (0..3)
+        .map(|_| tracker.dispatch(candidates[0].stats_index))
+        .collect();
+
+    let loaded = weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+    // (1 + 3) x 100ms of expected wait against an idle 100ms twin.
+    assert_eq!(loaded.entries[0].effective_latency_ms, Some(400.0));
+    assert_eq!(loaded.entries[1].effective_latency_ms, Some(100.0));
+    assert_eq!(
+        loaded.entries[0].weight, 16,
+        "(100/400)^3 * 1000, the idle twin is the reference"
+    );
+    assert_eq!(loaded.entries[1].weight, 1000);
+    assert!(loaded.entries[0].share < baseline.entries[0].share);
+
+    // Draining one request at a time moves the share monotonically back.
+    let mut guards = guards;
+    let mut previous = loaded.entries[0].share;
+    for expected_effective in [300.0, 200.0, 100.0] {
+        let guard = guards.pop().expect("three guards");
+        drop(guard);
+        let draining = weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+        assert_eq!(
+            draining.entries[0].effective_latency_ms,
+            Some(expected_effective)
+        );
+        assert!(
+            draining.entries[0].share > previous,
+            "share should recover as the queue drains"
+        );
+        previous = draining.entries[0].share;
+    }
+
+    // Fully drained: the identity is exact, not approximate — no memory of
+    // the burst survives it, so nothing can starve a candidate that just
+    // served one.
+    let drained = weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+    assert_eq!(drained.total_weight, baseline.total_weight);
+    for (drained, baseline) in drained.entries.iter().zip(&baseline.entries) {
+        assert_eq!(drained.weight, baseline.weight);
+        assert!((drained.share - baseline.share).abs() < 1e-12);
+    }
+}
+
+/// The probe floor is applied after the queue adjustment: a candidate that
+/// is both genuinely bad *and* busy keeps the same never-zero share it kept
+/// before this ticket — the adjustment reorders scores, it never deletes a
+/// candidate from its own schedule.
+#[test]
+fn a_busy_alias_still_floors_its_worst_candidate() {
+    let (candidates, tracker, _rr) = setup(&[("good", "m1"), ("bad", "m2")]);
+    for candidate in &candidates {
+        tracker.record_success(
+            candidate.stats_index,
+            LatencyMode::Streaming,
+            Duration::from_millis(100),
+        );
+    }
+    for _ in 0..50 {
+        tracker.record_error(candidates[1].stats_index);
+    }
+
+    // Three requests in flight on the healthy candidate inflate it to 400ms;
+    // the hard-failing candidate (effective latency clamped to 1000x the
+    // reference) is still hopeless next to that, and is still floored.
+    let guards: Vec<_> = (0..3)
+        .map(|_| tracker.dispatch(candidates[0].stats_index))
+        .collect();
+    let schedule = weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+    assert_eq!(schedule.entries[0].effective_latency_ms, Some(400.0));
+    assert_eq!(schedule.entries[1].weight, 10, "still at the probe floor");
+    assert!(schedule.entries[1].share > 0.0);
+    assert!(
+        schedule.entries[1].share < schedule.entries[0].share,
+        "and still ranked far below the healthy one"
+    );
+    drop(guards);
+}
+
+/// The queue adjustment reuses the one number `k` already scales: at
+/// `k = 0` every warm ratio is 1, and it stays 1 with a queue — a
+/// sharpness-0 alias splits evenly whether or not it is busy, exactly as
+/// documented.
+#[test]
+fn zero_sharpness_blindly_queues_too() {
+    let (candidates, tracker, _rr) = setup(&[("a", "m1"), ("b", "m2")]);
+    for candidate in &candidates {
+        tracker.record_success(
+            candidate.stats_index,
+            LatencyMode::Streaming,
+            Duration::from_millis(100),
+        );
+    }
+    let guards: Vec<_> = (0..4)
+        .map(|_| tracker.dispatch(candidates[0].stats_index))
+        .collect();
+
+    let schedule = weighted_schedule(&candidates, &tracker, 0.0, LatencyMode::Streaming);
+    assert_eq!(schedule.entries[0].effective_latency_ms, Some(500.0));
+    assert_eq!(
+        schedule.entries[0].weight, schedule.entries[1].weight,
+        "k = 0 raises every ratio, queue-inflated or not, to the power 0"
+    );
+    drop(guards);
 }
 
 const ALL_COLD: &str = concat!(

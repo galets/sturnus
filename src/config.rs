@@ -198,7 +198,9 @@ pub struct RoutingConfig {
     pub ewma_alpha: f64,
     /// Exploit sharpness for proportional routing: traffic scales with
     /// `(best_effective / its_effective)^exploit_k`, where effective latency
-    /// is the latency EWMA over the success-rate EWMA. Rarely needs changing.
+    /// is the latency EWMA over the success-rate EWMA, multiplied by
+    /// `(1 + in_flight)` so a candidate is scored on the wait a request can
+    /// expect, not the latency measured last. Rarely needs changing.
     pub exploit_k: f64,
     /// Error-rate EWMA above which a session-affinity pin is broken.
     /// Routing weights never consult it.
