@@ -300,6 +300,13 @@ pub async fn handle_request(
 
     let stats_index = candidate.stats_index;
 
+    // The request belongs to this candidate from here on, and the returned
+    // guard is what gives that back: it is moved into the relay stream for a
+    // streamed response and released when `forward_request` returns otherwise,
+    // so every way a request can end also ends its count. `Tracker::dispatch`
+    // explains why the count starts before the upstream is contacted.
+    let in_flight = state.tracker.dispatch(stats_index);
+
     info!(
         alias = %alias,
         provider = %candidate.provider_name,
@@ -329,6 +336,7 @@ pub async fn handle_request(
     let result = proxy::forward_request(
         &state.client,
         candidate,
+        in_flight,
         &path,
         outbound,
         is_streaming,
@@ -449,6 +457,11 @@ fn observability_get(path: &str, state: &AppState) -> Option<Response<BoxBody>> 
 }
 
 fn encode_metrics_response(state: &AppState) -> Response<BoxBody> {
+    // The in-flight gauge mirrors counts that live in the tracker, so it is
+    // written from them at scrape time rather than incremented alongside them:
+    // the exported number then cannot drift from the real count, and cannot
+    // stick above zero after a request is over.
+    state.metrics.set_in_flight(&in_flight_samples(state));
     match state.metrics.encode() {
         Ok(buf) => {
             let body = Bytes::from(buf);
@@ -469,6 +482,25 @@ fn encode_metrics_response(state: &AppState) -> Response<BoxBody> {
             )
         }
     }
+}
+
+/// One `(alias, provider, model, count)` row per candidate, for the in-flight
+/// gauge. A candidate reachable through several aliases appears once per alias,
+/// each row carrying the same count: it is one box with that many requests
+/// outstanding, not one queue per alias.
+fn in_flight_samples(state: &AppState) -> Vec<(&str, &str, &str, usize)> {
+    state
+        .model_map
+        .iter()
+        .map(|(alias, candidate)| {
+            (
+                alias,
+                candidate.provider_name.as_str(),
+                candidate.model.as_str(),
+                state.tracker.in_flight(candidate.stats_index),
+            )
+        })
+        .collect()
 }
 
 /// Metrics-listener handler: observability GETs only; never proxies.
@@ -664,11 +696,11 @@ fn routing_report(entry: &router::ScheduledCandidate<'_>) -> serde_json::Value {
 }
 
 /// `GET /status`: every candidate as the router currently sees it — its health
-/// (cold/warm/degraded), its measured latencies and error rate, and the weight
-/// and traffic share those numbers buy it in each alias that can use it, per
-/// latency mode. Weights come from the same [`router::weighted_schedule`] the
-/// picker draws from, so the reported numbers and the routing decision cannot
-/// drift apart.
+/// (cold/warm/degraded), its measured latencies and error rate, how many
+/// requests it is serving right now, and the weight and traffic share those
+/// numbers buy it in each alias that can use it, per latency mode. Weights come
+/// from the same [`router::weighted_schedule`] the picker draws from, so the
+/// reported numbers and the routing decision cannot drift apart.
 ///
 /// A candidate reachable through several aliases appears once per alias, since
 /// its share is relative to the candidates it competes with there.
@@ -721,6 +753,9 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
                 "streaming_ewma_ms": (streaming_ewma != u64::MAX).then_some(streaming_ewma),
                 "nonstreaming_ewma_ms": (nonstreaming_ewma != u64::MAX).then_some(nonstreaming_ewma),
                 "error_rate": 1.0 - stats.success_rate(),
+                // Live load, not a schedule number: it is one count per box, so
+                // it sits beside the error rate rather than per latency mode.
+                "in_flight": state.tracker.in_flight(candidate.stats_index),
                 "routing": {
                     "streaming": routing_report(streaming_entry),
                     "nonstreaming": routing_report(nonstreaming_entry),

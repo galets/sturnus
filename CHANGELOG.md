@@ -51,6 +51,25 @@ their history lives in the git log and tags.
   hard-failing candidate keeps half the alias's traffic, and what config
   *cannot* do — disable or bound session affinity, set a per-candidate weight,
   or move the probe floor and cold probe share.
+- **How many requests a candidate has outstanding right now.** `/status` lists
+  `in_flight` per candidate and `/metrics` exports
+  `sturnus_in_flight_requests`, a gauge labelled by `alias`, `provider` and
+  `model`. A request belongs to its candidate from the moment it is committed to
+  that candidate — before the upstream is contacted, so connecting, uploading,
+  time-to-first-byte and the stream itself are all covered — and the count is
+  given back by the guard the request travels with, when its response ends,
+  errors, or is dropped mid-stream. A caller that hangs up, a connect failure, a
+  timeout and an upstream 5xx therefore all return the count; none of them has to
+  be remembered, and the number cannot stick above zero. The gauge is written
+  from those live counts on every scrape rather than incremented per request, so
+  the exported value cannot drift from the count. Zero-initialised at startup
+  alongside the failure counters, so an idle candidate reads `0` rather than no
+  series. The point is to make queueing visible before any routing change reacts
+  to it: an agent that fires a same-instant pair of requests shows both of them
+  waiting on one box while the alias's other candidate sits at zero, which
+  latency-only routing notices only once latency has already degraded. A box
+  reachable through several aliases reports the same number under each of its
+  label sets, because it is one box's queue.
 
 ### Changed
 

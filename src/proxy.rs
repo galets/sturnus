@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use http_body_util::{Full, StreamBody};
 use hyper::body::{Body, Frame, SizeHint};
 use reqwest::header::{self, HeaderName};
@@ -16,6 +16,10 @@ use tracing::{debug, warn};
 use crate::body::RawBody;
 use crate::gcp_auth::GcpTokenProvider;
 use crate::model_map::{ProviderKind, ResolvedCandidate};
+use crate::tracker::InFlightGuard;
+
+/// The relayed upstream chunk stream a streaming response body is built from.
+type RelayStream = futures_util::stream::BoxStream<'static, Result<Frame<Bytes>, Infallible>>;
 
 pub type HyperBody = http_body_util::Either<
     Full<Bytes>,
@@ -38,7 +42,7 @@ pub struct ProxyResult {
 }
 
 pub enum ProxyBody {
-    Streaming(futures_util::stream::BoxStream<'static, Result<Frame<Bytes>, Infallible>>),
+    Streaming(RelayStream),
     Full(Bytes),
 }
 
@@ -129,9 +133,24 @@ pub fn is_reserved_request_header(name: &HeaderName) -> bool {
         || [API_KEY, X_API_KEY, ANTHROPIC_VERSION].contains(&name.as_str())
 }
 
+/// Forward one request to `candidate`, which the caller has already committed
+/// to and counted against via `in_flight`.
+///
+/// That guard is taken by value on purpose: it is what returns the candidate's
+/// in-flight count, and this function is where the response's lifetime is
+/// decided. On the streaming path it is moved into the relay stream, so the
+/// count is held until the stream ends, errors, or is dropped mid-flight; on
+/// every other path (a transport failure, a timeout, a response over the cap,
+/// or a whole buffered body) it is released as this function returns.
+// Eight arguments because a forward needs eight separate things — the client
+// pool, the candidate, its load handle, the path and body to send, the latency
+// mode, the response cap, the auth provider — and a struct that only shuttles
+// them from `AppState` would add a type without simplifying the one call site.
+#[allow(clippy::too_many_arguments)]
 pub async fn forward_request(
     client: &Client,
     candidate: &ResolvedCandidate,
+    in_flight: InFlightGuard,
     path: &str,
     body: OutboundBody,
     is_streaming: bool,
@@ -208,19 +227,60 @@ pub async fn forward_request(
         Ok(ProxyResult {
             status,
             headers,
-            body: ProxyBody::Streaming(Box::pin(combined)),
+            // The guard rides along inside the body, so the count is held for
+            // exactly as long as the response is being relayed: hyper drops
+            // the body when the response is written, when the caller hangs up,
+            // and when the connection dies, and each of those returns it.
+            body: ProxyBody::Streaming(Box::pin(Counted {
+                inner: Box::pin(combined),
+                guard: Some(in_flight),
+            })),
             latency: UpstreamLatency::Ttfc(ttfc),
         })
     } else {
         let full_body = read_capped(response, max_response_bytes).await?;
         let total = t0.elapsed();
 
+        // Buffered, so this candidate is finished with the request the moment
+        // its bytes are in hand: `in_flight` is released as this returns, while
+        // sturnus may still be writing the response to the caller. How long
+        // that takes is the caller's business, not the candidate's load.
         Ok(ProxyResult {
             status,
             headers,
             body: ProxyBody::Full(full_body),
             latency: UpstreamLatency::Total(total),
         })
+    }
+}
+
+/// A relay stream that owns the request's [`InFlightGuard`] for exactly as long
+/// as the stream itself exists.
+///
+/// This is how a dispatched request's in-flight count reaches the end of a
+/// streamed response. The count is returned by the guard's `Drop`, and there
+/// are two ways this stream drops it: as soon as the relay ends (the upstream
+/// is finished with the request, so its queue is not the point any more), and
+/// mid-flight when the stream itself is dropped — which is what hyper does to a
+/// response body once the caller hangs up or the connection dies, and what
+/// happens to a stream that never gets polled again. Nothing has to remember to
+/// release the count, and because the guard is taken out of `Option` exactly
+/// once there is no second decrement to get wrong.
+struct Counted {
+    inner: RelayStream,
+    /// `None` once the count has been returned.
+    guard: Option<InFlightGuard>,
+}
+
+impl Stream for Counted {
+    type Item = Result<Frame<Bytes>, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let item = Pin::new(&mut self.inner).poll_next(cx);
+        if matches!(item, Poll::Ready(None)) {
+            drop(self.guard.take());
+        }
+        item
     }
 }
 

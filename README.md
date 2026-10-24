@@ -198,10 +198,11 @@ Prometheus metrics on `/metrics`, all labelled by `alias`, `provider`, `model`:
 | `sturnus_ttfc_seconds` | histogram | Streaming time-to-first-chunk (streaming requests only) |
 | `sturnus_latency_seconds` | histogram | Non-streaming full response time (non-streaming requests only) |
 | `sturnus_errors_total` | counter | Transport failures that never produced a response (timeout, connect, DNS) |
+| `sturnus_in_flight_requests` | gauge | Requests outstanding against the candidate right now: counted from the moment it is chosen until its response ends, errors, or is dropped mid-flight |
 | `sturnus_buffer_rejections_total` | counter | Requests shed with `429` because the aggregate buffer budget was full (no per-alias labels) |
 | `sturnus_client_disconnects_total` | counter | Callers that hung up before their request completed (no per-alias labels). Benign: logged at debug, not ERROR |
 
-Connection failures are zero-initialised at startup so a missing series is never mistaken for "no errors".
+Connection failures and the in-flight gauge are zero-initialised at startup, so a missing series is never mistaken for "no errors" and an idle candidate reads `0` rather than nothing. The in-flight gauge is written from the live counts on every scrape instead of being incremented per request, so the exported number cannot drift from the real count or stick above zero after a request is over. It counts a *candidate*, not an alias: a box reachable through several aliases reports the same number under each of their label sets.
 
 ### Status
 
@@ -213,6 +214,7 @@ Connection failures are zero-initialised at startup so a missing series is never
     {
       "alias": "fast",
       "error_rate": 0.0,
+      "in_flight": 2,
       "model": "llama-3.3-70b",
       "nonstreaming_ewma_ms": 134,
       "provider": "groq",
@@ -226,6 +228,7 @@ Connection failures are zero-initialised at startup so a missing series is never
     {
       "alias": "fast",
       "error_rate": 0.0,
+      "in_flight": 0,
       "model": "gpt-4o-mini",
       "nonstreaming_ewma_ms": 201,
       "provider": "openai",
@@ -239,6 +242,7 @@ Connection failures are zero-initialised at startup so a missing series is never
     {
       "alias": "fast",
       "error_rate": 0.7599,
+      "in_flight": 0,
       "model": "qwen3-32b",
       "nonstreaming_ewma_ms": 113,
       "provider": "local",
@@ -254,6 +258,7 @@ Connection failures are zero-initialised at startup so a missing series is never
 ```
 
 - **`status`** — `cold` (no latency sample in either mode yet), `warm`, or `degraded` (its error-rate EWMA has passed `error_threshold`, which is also what breaks session-affinity pins to it).
+- **`in_flight`** — requests this candidate has outstanding right now, counted from the moment it is chosen (by the router or by an `x-session-affinity` pin) until its response ends, errors, or is dropped mid-flight, so the wait it covers includes connecting, uploading, TTFB and the stream itself. It is one count per box, so a candidate listed under several aliases shows the same number in every entry, and `0` means nothing is in flight. Read it against `share`: several requests queued on a candidate whose share says it should be getting a third of the alias is the congestion latency-only routing notices far too late.
 - **`routing.<mode>`** — the numbers a request of that mode is routed on, since streaming TTFC and non-streaming response time keep separate EWMAs. `weight` is `(best_effective / its_effective)^exploit_k` scaled so the best candidate in the alias gets 1000, `share` is that weight over the alias's total weight, and `effective_latency_ms` is the latency EWMA over the success-rate EWMA: the number the weight came from, so an erroring candidate's is larger than its latency EWMA (`null` while cold).
 - **A `share` near 0.01 is the probe floor, not starvation.** Every weight is floored at 1% of the best candidate's (`PROBE_FLOOR`), which is what keeps a broken box sampled and lets it win traffic back. A `share` of exactly 0 never happens; `local` above is at the floor in `streaming` (no successes there) and near it in `nonstreaming`.
 - **Weights are per alias.** A candidate reachable through several aliases appears once per alias, because its share is relative to whoever it competes with there.

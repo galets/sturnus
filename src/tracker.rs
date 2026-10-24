@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Streaming TTFC and non-streaming response time are tracked separately;
@@ -27,6 +28,10 @@ pub struct CandidateStats {
     /// EWMA of request outcomes (success = 1.0, error = 0.0) as f64 bits.
     /// Starts optimistic at 1.0; recovers via probe traffic, not a clock.
     success_rate: AtomicU64,
+    /// Requests currently outstanding against this candidate, held by
+    /// [`InFlightGuard`]. A count of a *candidate*, not of an alias: one box
+    /// reachable through several aliases has one queue, not one per alias.
+    in_flight: AtomicUsize,
 }
 
 impl Default for CandidateStats {
@@ -41,6 +46,7 @@ impl CandidateStats {
             streaming_ewma_ms: AtomicU64::new(u64::MAX),
             nonstreaming_ewma_ms: AtomicU64::new(u64::MAX),
             success_rate: AtomicU64::new(1.0_f64.to_bits()),
+            in_flight: AtomicUsize::new(0),
         }
     }
 
@@ -61,6 +67,11 @@ impl CandidateStats {
 
     pub fn success_rate(&self) -> f64 {
         f64::from_bits(self.success_rate.load(Ordering::Relaxed))
+    }
+
+    /// Requests outstanding against this candidate right now.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
     }
 
     pub fn record_outcome(&self, success: bool, alpha: f64) {
@@ -91,15 +102,18 @@ impl CandidateStats {
     }
 }
 
-/// Per-candidate stats stored in a flat `Vec`, addressed by a stable index
+/// Per-candidate state stored in a flat `Vec`, addressed by a stable index
 /// minted at `register` time. Indices are safe because `register` only
 /// appends and the tracker is frozen behind `&Tracker` once moved into
 /// `AppState`. Cross-alias sharing is preserved by `ModelMap` deduping
 /// (provider, model) pairs to the same index. One `alpha` smooths both the
 /// latency and success-rate EWMAs, so the signals react on the same timescale.
+///
+/// A slot is an `Arc` so that a request in flight can hold a handle on the
+/// candidate serving it ([`InFlightGuard`]) without borrowing the tracker.
 #[derive(Debug)]
 pub struct Tracker {
-    stats: Vec<CandidateStats>,
+    stats: Vec<Arc<CandidateStats>>,
     alpha: f64,
     error_threshold: f64,
 }
@@ -117,12 +131,42 @@ impl Tracker {
     /// for the lifetime of the tracker.
     pub fn register(&mut self) -> usize {
         let idx = self.stats.len();
-        self.stats.push(CandidateStats::new());
+        self.stats.push(Arc::new(CandidateStats::new()));
         idx
     }
 
     pub fn stats(&self, index: usize) -> &CandidateStats {
         &self.stats[index]
+    }
+
+    /// Requests outstanding against the candidate at `index` right now.
+    pub fn in_flight(&self, index: usize) -> usize {
+        self.stats[index].in_flight()
+    }
+
+    /// Count a request against the candidate it was just dispatched to, and
+    /// return the handle that owns that count.
+    ///
+    /// The count starts when a request is *committed* to a candidate — before
+    /// the upstream is contacted — so it covers the whole wait on that box:
+    /// connecting, uploading, time-to-first-byte and the stream itself. That
+    /// is what load-aware routing needs: a count that only appeared at first
+    /// byte would let a same-instant pair of requests both pick the same busy
+    /// candidate, which is exactly the condition they should have avoided.
+    /// There is no retry policy to place the count around — one request is
+    /// dispatched to exactly one candidate — and a request that never gets a
+    /// candidate (unknown alias, no healthy candidate, shed with 429) is never
+    /// counted at all.
+    ///
+    /// The count is returned by [`InFlightGuard::drop`], so releasing it rides
+    /// on the response rather than on the code paths that notice one: a
+    /// connect failure, a timeout, an upstream 5xx and a caller that hangs up
+    /// mid-stream all drop the guard, and nothing else has to remember to
+    /// decrement.
+    pub fn dispatch(&self, index: usize) -> InFlightGuard {
+        let stats = Arc::clone(&self.stats[index]);
+        stats.in_flight.fetch_add(1, Ordering::Relaxed);
+        InFlightGuard { stats }
     }
 
     pub fn record_success(&self, index: usize, mode: LatencyMode, observed: Duration) {
@@ -141,6 +185,58 @@ impl Tracker {
     /// it only breaks session-affinity pins and labels `/status`.
     pub fn is_degraded(&self, index: usize) -> bool {
         1.0 - self.stats[index].success_rate() > self.error_threshold
+    }
+}
+
+/// One unit of a candidate's in-flight count: the token a request carries from
+/// the moment it is dispatched to that candidate until its response is over.
+///
+/// The guard is the only place the count is released, and it is released
+/// exactly once, in `Drop`. That is what keeps the count honest on the paths
+/// that are easy to forget: for a streaming response the guard is moved into
+/// the relay stream, so the count comes back when the stream ends, when it
+/// errors, *and* when the stream is dropped mid-flight because the caller hung
+/// up or the connection died. There is deliberately no explicit release to
+/// call, because an explicit release alongside the `Drop` is a double
+/// decrement waiting to happen.
+///
+/// Not `Clone`: one dispatched request is one unit of load. The guard also
+/// owns the candidate's stats slot, so a request that wants to do something
+/// about the candidate when its response finishes — record an outcome against
+/// it, say — can do it from this handle, from inside the stream, without
+/// reaching back through the tracker.
+#[derive(Debug)]
+#[must_use = "the guard returns the in-flight count when dropped; hold it until the request is finished with"]
+pub struct InFlightGuard {
+    stats: Arc<CandidateStats>,
+}
+
+impl InFlightGuard {
+    /// The candidate this request is being counted against.
+    pub fn stats(&self) -> &CandidateStats {
+        &self.stats
+    }
+
+    /// Requests this candidate has outstanding right now, this one included.
+    pub fn in_flight(&self) -> usize {
+        self.stats.in_flight()
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        // Saturating, not `fetch_sub`: every guard is born from one increment
+        // and `Drop` runs once per guard, so it cannot underflow — but a wrap
+        // to `usize::MAX` would poison every future routing decision, and a
+        // stuck count is easier to live with than a poisoned router.
+        // Switch to `update` once MSRV reaches 1.95.
+        #[allow(deprecated)]
+        let _ = self
+            .stats
+            .in_flight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                Some(count.saturating_sub(1))
+            });
     }
 }
 

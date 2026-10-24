@@ -1,4 +1,5 @@
 use super::*;
+use crate::tracker::Tracker;
 use futures_util::stream;
 use futures_util::StreamExt;
 
@@ -208,4 +209,91 @@ fn sanitize_headers_strips_unsafe_and_preserves_rest() {
     }
     assert_eq!(sanitized.get("content-type").unwrap(), "application/json");
     assert_eq!(sanitized.get_all(reqwest::header::VARY).iter().count(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// The in-flight guard a streamed response carries (see `Counted`).
+// ---------------------------------------------------------------------------
+
+/// A counted stream over a source that never yields and never ends: the only
+/// way its guard can be released is the stream itself being dropped, which is
+/// what happens to a response body when the caller hangs up mid-stream.
+#[tokio::test]
+async fn dropping_a_counted_stream_mid_flight_returns_the_in_flight_count() {
+    let mut tracker = Tracker::new(0.3, 0.5);
+    let idx = tracker.register();
+    let counted = Counted {
+        inner: Box::pin(stream::pending::<Result<Frame<Bytes>, Infallible>>()),
+        guard: Some(tracker.dispatch(idx)),
+    };
+    assert_eq!(tracker.in_flight(idx), 1, "a live stream is load");
+
+    drop(counted);
+    assert_eq!(
+        tracker.in_flight(idx),
+        0,
+        "a stream dropped mid-flight must return the count"
+    );
+}
+
+/// A stream that ends on its own returns its count too — and the count is
+/// returned exactly once: releasing at end of stream must not be followed by a
+/// second release when the finished body is finally dropped.
+#[tokio::test]
+async fn a_counted_stream_returns_its_count_once_when_the_relay_ends() {
+    let mut tracker = Tracker::new(0.3, 0.5);
+    let idx = tracker.register();
+    let chunks: Vec<Result<Frame<Bytes>, Infallible>> =
+        vec![Ok(Frame::data(Bytes::from_static(b"data: a\n\n")))];
+    let mut counted = Counted {
+        inner: Box::pin(stream::iter(chunks)),
+        guard: Some(tracker.dispatch(idx)),
+    };
+
+    assert!(counted.next().await.is_some());
+    assert_eq!(tracker.in_flight(idx), 1, "still relaying");
+
+    assert!(counted.next().await.is_none());
+    assert_eq!(
+        tracker.in_flight(idx),
+        0,
+        "the candidate is done with the request once its stream ends"
+    );
+
+    // The finished stream is alive right here — hyper keeps a completed body
+    // until the response is written — so dropping it must not decrement again.
+    drop(counted);
+    assert_eq!(
+        tracker.in_flight(idx),
+        0,
+        "the count must be returned exactly once"
+    );
+}
+
+/// A stream that dies mid-body: the relay turns the failure into a terminating
+/// SSE error event and ends, and the count goes with it.
+#[tokio::test]
+async fn a_counted_stream_returns_its_count_when_the_upstream_stream_errors() {
+    let mut tracker = Tracker::new(0.3, 0.5);
+    let idx = tracker.register();
+    let source: Vec<Result<Bytes, String>> = vec![
+        Ok(Bytes::from_static(b"data: {\"chunk\":1}\n\n")),
+        Err("connection reset".to_string()),
+    ];
+    let mut counted = Counted {
+        inner: Box::pin(build_relay_stream(stream::iter(source))),
+        guard: Some(tracker.dispatch(idx)),
+    };
+
+    let mut frames = 0;
+    while let Some(frame) = counted.next().await {
+        assert!(frame.is_ok(), "the relay body is infallible");
+        frames += 1;
+    }
+    assert_eq!(frames, 2, "the chunk, then the terminating error event");
+    assert_eq!(
+        tracker.in_flight(idx),
+        0,
+        "a stream that died mid-flight returns its count"
+    );
 }
