@@ -13,6 +13,10 @@
 //! The paths covered are the ones a counter is usually wrong on: a caller that
 //! hangs up mid-stream, a stream that stalls or dies mid-body, a connect
 //! failure, an upstream timeout, an upstream 5xx, and normal completion.
+//!
+//! The last section tests the one rule that reads this count: a box with a
+//! prompt running is passed over for an idle one when a session is being
+//! placed, and a turn of a session that is already pinned never moves for it.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -750,4 +754,199 @@ async fn an_idle_candidate_exports_a_zero_gauge() {
         Some(0.0),
         "the series should exist before any traffic"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The placement rule that reads this count: a busy box is passed over for an
+// idle one, and a pinned turn never moves because of busyness.
+// ---------------------------------------------------------------------------
+
+/// Two candidates for the alias `fast`: `alpha` at declared weight 19, `beta`
+/// at 1. Weight alone always names alpha, so anything else a placement does is
+/// visible in the result.
+fn two_candidates(port_alpha: u16, port_beta: u16) -> String {
+    format!(
+        r#"
+[provider.alpha]
+base_url = "http://127.0.0.1:{port_alpha}"
+api_key = "fake"
+
+[provider.beta]
+base_url = "http://127.0.0.1:{port_beta}"
+api_key = "fake"
+
+[model]
+fast = [
+  {{ provider = "alpha", model = "m-alpha", weight = 19 }},
+  {{ provider = "beta", model = "m-beta", weight = 1 }},
+]
+"#
+    )
+}
+
+/// Mock upstream that answers every request immediately, so the candidate
+/// pointed at it is idle between turns.
+async fn eager_upstream() -> (u16, tokio::task::JoinHandle<()>) {
+    let (listener, port) = common::bind().await;
+    let handle = tokio::spawn(async move {
+        loop {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            common::read_once(&mut conn).await;
+            common::write_ok(&mut conn, r#"{"result":"ok"}"#).await;
+        }
+    });
+    (port, handle)
+}
+
+/// The `/status` row for `provider`.
+async fn status_row_for(addr: std::net::SocketAddr, provider: &str) -> serde_json::Value {
+    let body: serde_json::Value = serde_json::from_str(&get(addr, "/status").await).unwrap();
+    body["candidates"]
+        .as_array()
+        .expect("candidates array")
+        .iter()
+        .find(|row| row["provider"] == provider)
+        .unwrap_or_else(|| panic!("no /status row for {provider}: {body}"))
+        .clone()
+}
+
+/// Which candidate served a response, from the header sturnus sets.
+fn served_by(resp: &reqwest::Response) -> String {
+    resp.headers()
+        .get("x-sturnus-provider")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Put one held prompt on `alpha` and return its stream. The pin is how the
+/// test guarantees which box runs it; the request under test is the one after.
+async fn prompt_running_on_alpha(
+    addr: std::net::SocketAddr,
+    state: &Arc<AppState>,
+) -> impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> {
+    let first = caller_client()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("x-session-affinity", "alpha/m-alpha")
+        .json(&streaming_request("fast"))
+        .send()
+        .await
+        .unwrap();
+    let mut stream = first.bytes_stream();
+    stream.next().await.unwrap().unwrap();
+    wait_for_in_flight(state, "alpha", 1).await;
+    stream
+}
+
+/// A new session goes where it can start now. With the weight-preferred box
+/// mid-prompt, the placement lands on the box at a nineteenth the weight:
+/// busyness decides who is asked, weight only decides among equals.
+#[tokio::test]
+async fn a_new_session_takes_the_idle_box_when_the_weighted_one_is_mid_prompt() {
+    let (alpha_port, release, alpha_up) = held_sse_upstream().await;
+    let (beta_port, beta_up) = eager_upstream().await;
+    let state = state_for(&two_candidates(alpha_port, beta_port), caller_client());
+    let (addr, _shutdown) = start_server(state.clone());
+
+    let stream = prompt_running_on_alpha(addr, &state).await;
+
+    // A caller with no session header at all: pure placement.
+    let second = proxy_post(addr, request("fast")).await.unwrap();
+    assert_eq!(second.status(), 200);
+    assert_eq!(
+        served_by(&second),
+        "beta",
+        "a new session must not queue behind somebody else's prompt on a box \
+         that is idle"
+    );
+
+    release.add_permits(1);
+    let (_, failed) = drain(stream).await;
+    assert!(!failed, "the held stream ends cleanly once released");
+
+    alpha_up.abort();
+    beta_up.abort();
+}
+
+/// A turn of a session that is already pinned never moves because of busyness:
+/// it queues behind the running prompt on its own box, because re-prefilling a
+/// long conversation on the other box is the expensive outcome and queueing
+/// behind your own prompt is the cheap one.
+#[tokio::test]
+async fn a_pinned_turn_queues_behind_its_own_prompt_instead_of_moving_to_the_idle_box() {
+    let (alpha_port, release, alpha_up) = held_sse_upstream().await;
+    let (beta_port, beta_up) = eager_upstream().await;
+    let state = state_for(&two_candidates(alpha_port, beta_port), caller_client());
+    let (addr, _shutdown) = start_server(state.clone());
+
+    let stream = prompt_running_on_alpha(addr, &state).await;
+
+    // The same pin, next turn. beta is idle and alpha is mid-prompt. Streamed
+    // so the response headers arrive while the prompt is still held: a
+    // non-streaming turn is buffered whole, and this test needs to see where
+    // the turn was placed before it finishes.
+    let second = caller_client()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("x-session-affinity", "alpha/m-alpha")
+        .json(&streaming_request("fast"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 200);
+    assert_eq!(
+        served_by(&second),
+        "alpha",
+        "the pinned turn must stay on its box while that box is busy"
+    );
+    let mut second_stream = second.bytes_stream();
+    let first_chunk = second_stream.next().await.unwrap().unwrap();
+    assert!(
+        String::from_utf8_lossy(&first_chunk).contains("data: a"),
+        "the queued turn starts being answered: {first_chunk:?}"
+    );
+    assert_eq!(
+        in_flight(&state, "alpha"),
+        2,
+        "both of the session's turns are queued on alpha"
+    );
+
+    release.add_permits(2);
+    let (_, failed) = drain(stream).await;
+    assert!(!failed, "the held stream ends cleanly once released");
+    let (_, failed) = drain(second_stream).await;
+    assert!(!failed, "the queued turn ends cleanly once released");
+
+    alpha_up.abort();
+    beta_up.abort();
+}
+
+/// `/status` shows the busy/idle state the placement rule acts on, beside the
+/// count it is derived from, and a finished turn leaves the box idle again.
+#[tokio::test]
+async fn status_shows_a_box_running_a_prompt_as_busy() {
+    let (alpha_port, release, alpha_up) = held_sse_upstream().await;
+    let (beta_port, beta_up) = eager_upstream().await;
+    let state = state_for(&two_candidates(alpha_port, beta_port), caller_client());
+    let (addr, _shutdown) = start_server(state.clone());
+
+    let stream = prompt_running_on_alpha(addr, &state).await;
+
+    let alpha = status_row_for(addr, "alpha").await;
+    assert_eq!(alpha["in_flight"], 1, "{alpha}");
+    assert_eq!(alpha["busy"], true, "{alpha}");
+    let beta = status_row_for(addr, "beta").await;
+    assert_eq!(beta["in_flight"], 0, "{beta}");
+    assert_eq!(beta["busy"], false, "{beta}");
+
+    release.add_permits(1);
+    let (_, failed) = drain(stream).await;
+    assert!(!failed, "the held stream ends cleanly once released");
+    wait_for_in_flight(&state, "alpha", 0).await;
+
+    let alpha = status_row_for(addr, "alpha").await;
+    assert_eq!(alpha["busy"], false, "a finished turn leaves its box idle");
+
+    alpha_up.abort();
+    beta_up.abort();
 }

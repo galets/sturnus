@@ -272,7 +272,8 @@ pub async fn handle_request(
             reason: Placement::ExplicitPin,
         }
     } else {
-        let Some(placed) = router::place(candidates, &alias, &state.rr_state) else {
+        let Some(placed) = router::place(candidates, &alias, &state.rr_state, &state.tracker)
+        else {
             return Ok(json_error(
                 hyper::StatusCode::BAD_GATEWAY,
                 &format!("no healthy candidate for model alias '{alias}'"),
@@ -757,7 +758,11 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
                 "status": status,
                 // Live load, not a schedule number: it is one count per box, so
                 // it sits beside the health fields rather than in `routing`.
+                // `busy` is the word the placement rule uses — a box with a
+                // prompt running is passed over for an idle one — so the same
+                // word an operator sees in a log line is readable here.
                 "in_flight": state.tracker.in_flight(stats_index),
+                "busy": state.tracker.in_flight(stats_index) > 0,
                 "routing": routing_report(entry),
                 "observed": observed_report(state, stats_index),
             }));

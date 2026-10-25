@@ -1,4 +1,5 @@
 use crate::model_map::ResolvedCandidate;
+use crate::tracker::Tracker;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
@@ -201,24 +202,47 @@ pub fn pick_weighted<'a>(
     pool.last().copied()
 }
 
-/// Place a turn among `candidates` by declared weight.
+/// Place a turn among `candidates` by declared weight, preferring an idle box.
 ///
-/// Draws from the schedule [`placement_schedule`] describes, so a caller that
-/// reports those numbers sees the weights the pick actually used.
+/// Weight decides between candidates that are equally able to start now;
+/// busyness decides who gets asked at all. A candidate with a prompt running
+/// is passed over for an idle one whatever its weight, because the cheap
+/// outcome for a new session is a box that starts it immediately and the
+/// expensive one is a queue behind somebody else's prompt. When every
+/// candidate is busy the least busy wins, and weight breaks that tie.
 ///
-/// Eligibility — a candidate that is demoted, and the busy/idle preference —
-/// is not consulted here yet; the tickets that add them extend this function
-/// rather than adding a second placement path.
+/// A session that is already pinned does not come through here: its next turn
+/// queues behind the running prompt on its own box (the pin path in
+/// `server.rs`), because re-prefilling a long conversation on a slower box is
+/// the expensive outcome and queueing behind your own prompt is the cheap one.
+///
+/// The demotion input to eligibility comes in the next ticket; the pool is
+/// every candidate of the alias until then.
 pub fn place<'a>(
     candidates: &'a [ResolvedCandidate],
     alias: &str,
     rr: &RoundRobinState,
+    tracker: &Tracker,
 ) -> Option<Placed<'a>> {
-    let pool: Vec<&ResolvedCandidate> = candidates.iter().collect();
+    // `min` over an empty candidate list is `None`, so a misconfigured alias
+    // yields no placement and consumes no tick.
+    let least_busy = candidates
+        .iter()
+        .map(|c| tracker.in_flight(c.stats_index))
+        .min()?;
+    let pool: Vec<&ResolvedCandidate> = candidates
+        .iter()
+        .filter(|c| tracker.in_flight(c.stats_index) == least_busy)
+        .collect();
+
     let candidate = pick_weighted(&pool, alias, rr)?;
     Some(Placed {
         candidate,
-        reason: Placement::FreshByWeight,
+        reason: if least_busy == 0 {
+            Placement::FreshByWeight
+        } else {
+            Placement::OverflowBusy
+        },
     })
 }
 
