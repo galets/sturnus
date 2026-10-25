@@ -188,18 +188,30 @@ impl ProviderConfig {
 pub struct ModelCandidate {
     pub provider: String,
     pub model: String,
+    /// Declared preference within the alias, defaulting to 1. The share of the
+    /// alias's traffic this candidate is meant to get is its weight over the
+    /// sum of the alias's weights. Declared, never measured: see
+    /// [`crate::router::placement_schedule`].
+    #[serde(default = "default_weight")]
+    pub weight: usize,
+}
+
+fn default_weight() -> usize {
+    1
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct RoutingConfig {
     /// Smoothing shared by the latency and success-rate EWMAs
-    /// (~`1/ewma_alpha` samples of memory).
+    /// (~`1/ewma_alpha` samples of memory). The EWMAs they feed are
+    /// observability only: routing allocates by declared `weight`.
     pub ewma_alpha: f64,
-    /// Exploit sharpness for proportional routing: traffic scales with
-    /// `(best_effective / its_effective)^exploit_k`, where effective latency
-    /// is the latency EWMA over the success-rate EWMA. Rarely needs changing.
-    pub exploit_k: f64,
+    /// Accepted so a stale config is *reported* rather than silently ignored:
+    /// the measured allocator it belonged to is gone, and `validate` rejects
+    /// any config that sets it.
+    #[serde(default)]
+    pub exploit_k: Option<f64>,
     /// Error-rate EWMA above which a session-affinity pin is broken.
     /// Routing weights never consult it.
     pub error_threshold: f64,
@@ -221,7 +233,7 @@ impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
             ewma_alpha: 0.3,
-            exploit_k: crate::router::EXPLOIT_K,
+            exploit_k: None,
             error_threshold: 0.5,
             connect_timeout_secs: 10,
             read_timeout_secs: 60,
@@ -378,10 +390,14 @@ impl Config {
                 self.routing.ewma_alpha
             );
         }
-        if !self.routing.exploit_k.is_finite() || self.routing.exploit_k < 0.0 {
+        if self.routing.exploit_k.is_some() {
+            // A stale config must not silently mean something else: the
+            // measured allocator this tuned no longer exists, so a config that
+            // sets it would be tuning nothing while reading as if it worked.
             anyhow::bail!(
-                "exploit_k must be a finite value >= 0.0, got {}",
-                self.routing.exploit_k
+                "routing.exploit_k is no longer used: traffic is allocated by each \
+                 candidate's declared `weight` (an integer, default 1) in the [model] \
+                 alias list; remove exploit_k"
             );
         }
         if !(0.0..=1.0).contains(&self.routing.error_threshold) {
@@ -427,6 +443,18 @@ impl Config {
                     anyhow::bail!(
                         "model alias '{alias}' references unknown provider '{}'",
                         c.provider
+                    );
+                }
+                if c.weight < 1 {
+                    // A zero weight would buy a candidate a share of zero, and
+                    // the weighted draw has no way to express "never": use a
+                    // candidate list that omits it, or a demotion.
+                    anyhow::bail!(
+                        "model alias '{alias}' candidate '{}/{}' has weight {}; \
+                         weight must be at least 1",
+                        c.provider,
+                        c.model,
+                        c.weight
                     );
                 }
             }

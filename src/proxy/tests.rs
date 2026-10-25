@@ -139,6 +139,7 @@ fn make_candidate(kind: ProviderKind, base_url: &str) -> ResolvedCandidate {
         stats_index: 0,
         provider_header: hyper::header::HeaderValue::from_static("test"),
         affinity_header: hyper::header::HeaderValue::from_static("test/gpt-4o"),
+        weight: 1,
         attribution_labels: None,
         extra_headers: Default::default(),
     }

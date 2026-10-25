@@ -20,7 +20,7 @@ use crate::gcp_auth::GcpTokenProvider;
 use crate::metrics::Metrics;
 use crate::model_map::ModelMap;
 use crate::proxy::{self, UpstreamLatency};
-use crate::router::{self, RoundRobinState};
+use crate::router::{self, Placed, Placement, RoundRobinState};
 use crate::tracker::{LatencyMode, Tracker};
 
 pub struct AppState {
@@ -28,7 +28,6 @@ pub struct AppState {
     pub tracker: Tracker,
     pub rr_state: RoundRobinState,
     pub client: reqwest::Client,
-    pub exploit_k: f64,
     pub gcp_token_provider: Option<GcpTokenProvider>,
     pub budget: BufferBudget,
     pub metrics: Metrics,
@@ -264,39 +263,41 @@ pub async fn handle_request(
         LatencyMode::NonStreaming
     };
 
-    let candidate = if let Some(c) = pinned {
-        // A pin bypasses the router entirely, so log it as a pin: at debug a
-        // pinned request must not read like a weighted decision it never made.
-        debug!(
-            alias = %alias,
-            provider = %c.provider_name,
-            model = %c.model,
-            mode = latency_mode.as_str(),
-            "session affinity pin honored, router bypassed"
-        );
-        c
+    let placed = if let Some(c) = pinned {
+        // An explicit pin bypasses the placement path entirely, so log it as a
+        // pin: at debug a pinned request must not read like a weighted
+        // decision it never made.
+        Placed {
+            candidate: c,
+            reason: Placement::ExplicitPin,
+        }
     } else {
-        // The schedule is built here rather than inside the picker so the
-        // weights behind this choice can be logged: the same numbers `/status`
-        // reports, from the same seam.
-        let schedule =
-            router::weighted_schedule(candidates, &state.tracker, state.exploit_k, latency_mode);
-        let Some(c) = router::pick_from_schedule(&schedule, &alias, &state.rr_state) else {
+        let Some(placed) = router::place(candidates, &alias, &state.rr_state) else {
             return Ok(json_error(
                 hyper::StatusCode::BAD_GATEWAY,
                 &format!("no healthy candidate for model alias '{alias}'"),
             ));
         };
+        placed
+    };
+
+    // One line per request naming why this box: the reason the placement path
+    // produced, beside the declared weights it drew from — the same numbers
+    // `/status` reports. Gated so the schedule is not built for a request the
+    // log level will not show.
+    if tracing::enabled!(tracing::Level::DEBUG) {
         debug!(
             alias = %alias,
-            provider = %c.provider_name,
-            model = %c.model,
+            provider = %placed.candidate.provider_name,
+            model = %placed.candidate.model,
             mode = latency_mode.as_str(),
-            shares = %schedule,
+            reason = placed.reason.as_str(),
+            shares = %router::placement_schedule(candidates),
             "routing decision"
         );
-        c
-    };
+    }
+
+    let candidate = placed.candidate;
 
     let stats_index = candidate.stats_index;
 
@@ -682,25 +683,37 @@ fn is_benign_disconnect(error: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-/// One candidate's live routing numbers for one latency mode, taken straight
-/// from the schedule the picker consumes: what the router would do right now
-/// if a request of this mode arrived.
+/// One candidate's allocation numbers for one alias, taken straight from the
+/// schedule the picker draws from: the declared weight and the share it buys.
 fn routing_report(entry: &router::ScheduledCandidate<'_>) -> serde_json::Value {
     serde_json::json!({
-        // `null` while cold: there is no measured latency to weigh yet, so the
-        // weight is a probe share rather than a ranking.
-        "effective_latency_ms": entry.effective_latency_ms,
         "weight": entry.weight,
         "share": entry.share,
     })
 }
 
+/// What the router measures but deliberately does not route on. Reported so an
+/// operator can see a box that has quietly gotten slow — the detection the
+/// measured allocator used to do automatically is, in this design, a human
+/// reading a number and changing a `weight`.
+fn observed_report(state: &AppState, stats_index: usize) -> serde_json::Value {
+    let stats = state.tracker.stats(stats_index);
+    let streaming_ewma = stats.ewma_ms(LatencyMode::Streaming);
+    let nonstreaming_ewma = stats.ewma_ms(LatencyMode::NonStreaming);
+    serde_json::json!({
+        "note": "measured, not used for routing: allocation is by declared weight",
+        "streaming_ewma_ms": (streaming_ewma != u64::MAX).then_some(streaming_ewma),
+        "nonstreaming_ewma_ms": (nonstreaming_ewma != u64::MAX).then_some(nonstreaming_ewma),
+        "error_rate": 1.0 - stats.success_rate(),
+    })
+}
+
 /// `GET /status`: every candidate as the router currently sees it — its health
-/// (cold/warm/degraded), its measured latencies and error rate, how many
-/// requests it is serving right now, and the weight and traffic share those
-/// numbers buy it in each alias that can use it, per latency mode. Weights come
-/// from the same [`router::weighted_schedule`] the picker draws from, so the
-/// reported numbers and the routing decision cannot drift apart.
+/// (cold/warm/degraded), the declared weight and traffic share it holds in each
+/// alias that can use it, how many requests it is serving right now, and the
+/// latencies and error rate the router measures without routing on. Weights
+/// come from the same [`router::placement_schedule`] the picker draws from, so
+/// the reported numbers and the routing decision cannot drift apart.
 ///
 /// A candidate reachable through several aliases appears once per alias, since
 /// its share is relative to the candidates it competes with there.
@@ -715,31 +728,23 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
         let Some(group) = state.model_map.get(alias) else {
             continue;
         };
-        let streaming = router::weighted_schedule(
-            group,
-            &state.tracker,
-            state.exploit_k,
-            LatencyMode::Streaming,
-        );
-        let nonstreaming = router::weighted_schedule(
-            group,
-            &state.tracker,
-            state.exploit_k,
-            LatencyMode::NonStreaming,
-        );
+        let schedule = router::placement_schedule(group);
 
-        // Both schedules walk the same slice, so their entries line up.
-        for (streaming_entry, nonstreaming_entry) in
-            streaming.entries.iter().zip(&nonstreaming.entries)
-        {
-            let candidate = streaming_entry.candidate;
-            let stats = state.tracker.stats(candidate.stats_index);
-            let streaming_ewma = stats.ewma_ms(LatencyMode::Streaming);
-            let nonstreaming_ewma = stats.ewma_ms(LatencyMode::NonStreaming);
+        for entry in &schedule.entries {
+            let candidate = entry.candidate;
+            let stats_index = candidate.stats_index;
+            let streaming_ewma = state
+                .tracker
+                .stats(stats_index)
+                .ewma_ms(LatencyMode::Streaming);
+            let nonstreaming_ewma = state
+                .tracker
+                .stats(stats_index)
+                .ewma_ms(LatencyMode::NonStreaming);
             let any_warm = streaming_ewma != u64::MAX || nonstreaming_ewma != u64::MAX;
             let status = if !any_warm {
                 "cold"
-            } else if state.tracker.is_degraded(candidate.stats_index) {
+            } else if state.tracker.is_degraded(stats_index) {
                 "degraded"
             } else {
                 "warm"
@@ -750,20 +755,14 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
                 "provider": candidate.provider_name,
                 "model": candidate.model,
                 "status": status,
-                "streaming_ewma_ms": (streaming_ewma != u64::MAX).then_some(streaming_ewma),
-                "nonstreaming_ewma_ms": (nonstreaming_ewma != u64::MAX).then_some(nonstreaming_ewma),
-                "error_rate": 1.0 - stats.success_rate(),
                 // Live load, not a schedule number: it is one count per box, so
-                // it sits beside the error rate rather than per latency mode.
-                "in_flight": state.tracker.in_flight(candidate.stats_index),
-                "routing": {
-                    "streaming": routing_report(streaming_entry),
-                    "nonstreaming": routing_report(nonstreaming_entry),
-                },
+                // it sits beside the health fields rather than in `routing`.
+                "in_flight": state.tracker.in_flight(stats_index),
+                "routing": routing_report(entry),
+                "observed": observed_report(state, stats_index),
             }));
         }
     }
-
     let body = serde_json::json!({
         "candidates": candidates,
     });

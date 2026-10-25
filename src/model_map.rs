@@ -28,6 +28,10 @@ pub struct ResolvedCandidate {
     pub stats_index: usize,
     pub provider_header: HeaderValue,
     pub affinity_header: HeaderValue,
+    /// Declared preference within the alias, in traffic-share units. Never 0:
+    /// config rejects it. This is the whole allocation policy — see
+    /// [`crate::router::placement_schedule`].
+    pub weight: usize,
     /// Labels to merge into the outbound body as Vertex `labels`.
     /// `None` unless this provider opted in. Shared across candidates
     /// since the contents are immutable after config load.
@@ -103,6 +107,7 @@ impl ModelMap {
                         stats_index,
                         provider_header,
                         affinity_header,
+                        weight: c.weight,
                         attribution_labels,
                         extra_headers,
                     })

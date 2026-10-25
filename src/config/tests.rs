@@ -135,8 +135,11 @@ fast = [{ provider = "openai", model = "gpt-4o-mini" }]
     assert_eq!(config.routing.read_timeout_secs, 60);
 }
 
+/// A config written for the measured allocator must fail loudly, not silently
+/// mean something else. The message names the replacement, because the only
+/// way to get a 95% share now is to declare it.
 #[test]
-fn exploit_k_rejects_negative() {
+fn a_stale_exploit_k_is_rejected_naming_its_replacement() {
     let toml_str = r#"
 [provider.openai]
 base_url = "https://api.openai.com/v1"
@@ -146,16 +149,16 @@ api_key = "sk-test"
 fast = [{ provider = "openai", model = "gpt-4o-mini" }]
 
 [routing]
-exploit_k = -1.0
+exploit_k = 3.0
 "#;
     let config: Config = toml::from_str(toml_str).unwrap();
-    assert!(config.validate().is_err());
+    let err = config.validate().unwrap_err().to_string();
+    assert!(err.contains("routing.exploit_k"), "{err}");
+    assert!(err.contains("weight"), "{err}");
 }
 
 #[test]
-fn exploit_k_defaults_to_the_documented_sharpness() {
-    // README and config.example.toml document 3.0 as the default and tabulate
-    // traffic shares at it, and both say 0.0 is accepted as an even split.
+fn a_candidate_weight_defaults_to_one() {
     let toml_str = r#"
 [provider.openai]
 base_url = "https://api.openai.com/v1"
@@ -165,14 +168,48 @@ api_key = "sk-test"
 fast = [{ provider = "openai", model = "gpt-4o-mini" }]
 "#;
     let config: Config = toml::from_str(toml_str).unwrap();
-    assert_eq!(config.routing.exploit_k, crate::router::EXPLOIT_K);
-    assert_eq!(config.routing.exploit_k, 3.0);
+    assert_eq!(config.model["fast"][0].weight, 1);
     assert!(config.validate().is_ok());
+}
 
-    let zero: Config =
-        toml::from_str(&format!("{toml_str}\n[routing]\nexploit_k = 0.0\n")).unwrap();
-    assert_eq!(zero.routing.exploit_k, 0.0);
-    assert!(zero.validate().is_ok(), "an even split is a legal choice");
+#[test]
+fn an_explicit_weight_is_parsed() {
+    let toml_str = r#"
+[provider.fast]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[provider.slow]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [
+  { provider = "fast", model = "m", weight = 19 },
+  { provider = "slow", model = "m", weight = 1 },
+]
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.model["fast"][0].weight, 19);
+    assert_eq!(config.model["fast"][1].weight, 1);
+    assert!(config.validate().is_ok());
+}
+
+/// A weight of 0 has no meaning the weighted draw can express: a candidate
+/// that should never serve is left out of the list, not weighted at zero.
+#[test]
+fn a_zero_weight_is_rejected() {
+    let toml_str = r#"
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini", weight = 0 }]
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    let err = config.validate().unwrap_err().to_string();
+    assert!(err.contains("weight must be at least 1"), "{err}");
 }
 
 #[test]

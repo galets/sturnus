@@ -1,11 +1,11 @@
 use crate::model_map::ResolvedCandidate;
-use crate::tracker::{LatencyMode, Tracker};
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
-/// One counter per alias, walked over the weighted schedule (no RNG).
+/// One counter per alias, walked over the weighted draw (no RNG).
 #[derive(Debug)]
 pub struct RoundRobinState {
-    counters: std::collections::HashMap<String, std::sync::atomic::AtomicUsize>,
+    counters: HashMap<String, std::sync::atomic::AtomicUsize>,
 }
 
 impl Default for RoundRobinState {
@@ -17,7 +17,7 @@ impl Default for RoundRobinState {
 impl RoundRobinState {
     pub fn new() -> Self {
         Self {
-            counters: std::collections::HashMap::new(),
+            counters: HashMap::new(),
         }
     }
 
@@ -34,66 +34,84 @@ impl RoundRobinState {
     }
 }
 
-/// Default exploit sharpness (the `routing.exploit_k` default): traffic to
-/// each candidate is proportional to `(best_effective / its_effective)^k`,
-/// where effective latency folds the error rate in. Higher = stronger
-/// preference for the best. Scale-invariant (depends on the ratio, not
-/// absolute ms), so a fixed default generalises: a 2x-worse candidate gets
-/// ~1/8 the traffic, a 5x-worse one ~1/125.
-pub const EXPLOIT_K: f64 = 3.0;
-
-/// Fastest candidate gets this many weight units; everyone else's weight is
-/// scaled relative to it (but never below the `PROBE_FLOOR` share).
-const WEIGHT_RESOLUTION: f64 = 1000.0;
-
-/// Cold candidates probe at this fraction of the fastest candidate's rate.
-const COLD_PROBE_WEIGHT: f64 = 0.25;
-
-/// Minimum weight for any candidate, as a fraction of `WEIGHT_RESOLUTION`.
-/// This is the probe rate for a hard-failing candidate, and it bounds both
-/// sides of the same trade: at most ~this share of alias traffic eats
-/// user-facing errors during an outage (there is no failover retry), and a
-/// recovered candidate is re-detected within ~`1/PROBE_FLOOR` requests.
-const PROBE_FLOOR: f64 = 0.01;
-
-/// Success-rate floor inside effective latency: a fully failing candidate
-/// gets a finite (huge) value rather than a division by zero.
-const MIN_SUCCESS_RATE: f64 = 1e-3;
-
 /// 2^64 / φ, the Weyl-sequence step. Odd, so `wrapping_mul` is a bijection.
+///
+/// The sequence is the deterministic stand-in for the uniform sample in a
+/// weighted choice (cf. `rand::distributions::WeightedIndex`): consecutive
+/// ticks land spread over the weight range rather than clumping, so equal
+/// candidates alternate exactly and a 2:1 pair splits 2:1 over a long run of
+/// picks. Deterministic means the split is reproducible in a test and in a
+/// debug log, with no RNG to seed.
 const WEYL_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// One candidate's place in a [`WeightedSchedule`].
+/// Why a turn landed on the candidate it did.
+///
+/// Every placement reports one of these, so "why this box, this turn?" is a
+/// log line rather than an inference: the reason is the shape of the decision
+/// the placement path actually made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// The caller demanded a specific `provider/model` and got it.
+    ExplicitPin,
+    /// The turn belongs to a session already pinned to this candidate.
+    Pinned,
+    /// A new session, placed on an idle candidate in proportion to weight.
+    FreshByWeight,
+    /// Placed away from the weight-preferred candidate because it was busy.
+    OverflowBusy,
+    /// Placed on a demoted candidate: either the session's pin was demoted, or
+    /// every candidate of the alias is demoted and the highest-weight one
+    /// serves so the caller sees the box's own error, not one we invented.
+    OverflowDemoted,
+}
+
+impl Placement {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Placement::ExplicitPin => "explicit-pin",
+            Placement::Pinned => "pinned",
+            Placement::FreshByWeight => "fresh-by-weight",
+            Placement::OverflowBusy => "overflow-busy",
+            Placement::OverflowDemoted => "overflow-demoted",
+        }
+    }
+}
+
+/// A placement decision: the candidate that serves the turn, and why.
+#[derive(Debug)]
+pub struct Placed<'a> {
+    pub candidate: &'a ResolvedCandidate,
+    pub reason: Placement,
+}
+
+/// One candidate's declared weight and the share that weight buys it in the
+/// group it was scheduled with.
 #[derive(Debug, Clone)]
 pub struct ScheduledCandidate<'a> {
     pub candidate: &'a ResolvedCandidate,
-    /// Integer weight in `WEIGHT_RESOLUTION` units; never below the probe floor.
+    /// The declared integer weight. Never zero: config rejects it.
     pub weight: usize,
-    /// Normalised traffic share, `weight / total_weight`, in `0.0..=1.0`.
+    /// `weight / total_weight`, in `0.0..=1.0`.
     pub share: f64,
-    /// Effective latency (ms per successful response) the weight was derived
-    /// from, including the guards applied to it. `None` while cold for this
-    /// mode, which is why a cold candidate's weight is a probe, not a ranking.
-    pub effective_latency_ms: Option<f64>,
 }
 
-/// The weighted schedule for one alias at one moment.
+/// The declared-weight schedule for one group of competing candidates.
 ///
 /// Computed independently of any pick so callers can inspect the weights and
 /// shares without consuming a tick. The pick path draws from this same
 /// schedule, keeping the reported numbers and the routing decision in sync.
 #[derive(Debug)]
-pub struct WeightedSchedule<'a> {
+pub struct PlacementSchedule<'a> {
     pub entries: Vec<ScheduledCandidate<'a>>,
-    /// Sum of every entry's weight; the modulus of the Weyl pick.
+    /// Sum of every entry's weight; the modulus of the weighted draw.
     pub total_weight: usize,
 }
 
 /// Every candidate's share on one line, e.g.
-/// `groq/llama-3.3-70b=88.9% openai/gpt-4o-mini=11.1%` — the shape the routing
-/// debug line wants. `Display` rather than a built `String` so
+/// `cuda30/fast=66.7% llama30/slow=33.3%` — the shape the routing debug line
+/// wants. `Display` rather than a built `String` so
 /// `debug!(shares = %schedule)` costs nothing unless the callsite is enabled.
-impl std::fmt::Display for WeightedSchedule<'_> {
+impl std::fmt::Display for PlacementSchedule<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for (i, entry) in self.entries.iter().enumerate() {
             if i > 0 {
@@ -111,81 +129,28 @@ impl std::fmt::Display for WeightedSchedule<'_> {
     }
 }
 
-/// Compute the weighted schedule for `candidates` in `mode`.
+/// The declared-weight schedule for `candidates`.
 ///
-/// Weights use *effective latency* — the latency EWMA over the success-rate
-/// EWMA, i.e. expected time per successful response. Each candidate gets
-/// traffic proportional to `(best_effective / its_effective)^k`, so slower
-/// or erroring candidates keep a small but never-zero share. That share
-/// doubles as the probe through which a recovered candidate wins traffic back.
+/// This is the whole allocation policy: a candidate's share of its group is
+/// its weight over the group's total weight. Nothing measured — latency,
+/// error rate, queue depth — scales it. A 19:1 split is written as
+/// `weight = 19` beside `weight = 1`, not discovered by probing.
 ///
-/// Pure: reads the tracker but does not advance the round-robin counter, so
-/// it can be called for observability without perturbing routing.
-pub fn weighted_schedule<'a>(
-    candidates: &'a [ResolvedCandidate],
-    tracker: &Tracker,
-    k: f64,
-    mode: LatencyMode,
-) -> WeightedSchedule<'a> {
-    // Effective latency (ms per successful response); None = cold for `mode`.
-    let effective: Vec<Option<f64>> = candidates
+/// Pure: advances no counter and reserves nothing, so `/status` renders the
+/// same arithmetic with no effect on routing.
+pub fn placement_schedule(candidates: &[ResolvedCandidate]) -> PlacementSchedule<'_> {
+    let total_weight: usize = candidates.iter().map(|c| c.weight).sum();
+
+    let entries = candidates
         .iter()
-        .map(|c| {
-            let stats = tracker.stats(c.stats_index);
-            if stats.is_cold(mode) {
-                None
-            } else {
-                // Guarded against a 0ms EWMA.
-                #[allow(clippy::cast_precision_loss)]
-                Some(stats.ewma_ms(mode).max(1) as f64 / stats.success_rate().max(MIN_SUCCESS_RATE))
-            }
+        .map(|candidate| ScheduledCandidate {
+            weight: candidate.weight,
+            candidate,
+            share: normalised_share(candidate.weight, total_weight),
         })
         .collect();
 
-    // Reference = best effective latency; infinite while everyone is cold.
-    let best = effective
-        .iter()
-        .flatten()
-        .copied()
-        .fold(f64::INFINITY, f64::min);
-
-    // Floor at the probe share so no candidate starves.
-    let mut entries: Vec<ScheduledCandidate<'a>> = Vec::with_capacity(candidates.len());
-    let mut total_weight: usize = 0;
-    for (candidate, effective_latency) in candidates.iter().zip(&effective) {
-        let raw_weight = match effective_latency {
-            Some(latency) => (best / latency).powf(k),
-            // Cold: fixed probe share (full when everyone is cold), scaled
-            // by success rate so erroring cold candidates back off too.
-            None => {
-                let rate = tracker.stats(candidate.stats_index).success_rate();
-                let base = if best.is_finite() {
-                    COLD_PROBE_WEIGHT
-                } else {
-                    1.0
-                };
-                base * rate.max(MIN_SUCCESS_RATE).powf(k)
-            }
-        };
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let weight = (raw_weight * WEIGHT_RESOLUTION)
-            .round()
-            .max(WEIGHT_RESOLUTION * PROBE_FLOOR) as usize;
-        entries.push(ScheduledCandidate {
-            candidate,
-            weight,
-            share: 0.0,
-            effective_latency_ms: *effective_latency,
-        });
-        total_weight += weight;
-    }
-
-    // Shares are only meaningful once the total is known.
-    for entry in &mut entries {
-        entry.share = normalised_share(entry.weight, total_weight);
-    }
-
-    WeightedSchedule {
+    PlacementSchedule {
         entries,
         total_weight,
     }
@@ -193,9 +158,9 @@ pub fn weighted_schedule<'a>(
 
 /// `weight / total_weight`, guarding the divide.
 ///
-/// A zero total is unreachable today — every entry keeps at least the probe
-/// floor — but these numbers are rendered by `/status` and the routing debug
-/// line now, so a `NaN` reaching an operator would be worse than a `0.0`.
+/// A zero total is unreachable today — every weight is at least 1 — but these
+/// numbers are rendered by `/status` and the routing debug line, so a `NaN`
+/// reaching an operator would be worse than a `0.0`.
 fn normalised_share(weight: usize, total_weight: usize) -> f64 {
     if total_weight == 0 {
         return 0.0;
@@ -206,52 +171,55 @@ fn normalised_share(weight: usize, total_weight: usize) -> f64 {
     weight / total_weight
 }
 
-/// Draw a pick from a previously computed [`WeightedSchedule`].
+/// Draw one candidate from `pool` in proportion to declared weight.
 ///
-/// Golden-ratio Weyl sequence (n·2^64/φ): a deterministic stand-in for the
-/// uniform sample in weighted choice (cf. rand::distributions::WeightedIndex).
-/// Stays equidistributed even when modes subsample the shared counter.
-pub fn pick_from_schedule<'a>(
-    schedule: &WeightedSchedule<'a>,
+/// Golden-ratio Weyl sequence (`n·2^64/φ`) over the pool's total weight:
+/// deterministic, equidistributed, and it stays equidistributed when the pool
+/// is a filtered subset (idle candidates only, say).
+pub fn pick_weighted<'a>(
+    pool: &[&'a ResolvedCandidate],
     alias: &str,
     rr: &RoundRobinState,
 ) -> Option<&'a ResolvedCandidate> {
-    // No tick is consumed for an empty schedule, matching the old early return.
-    if schedule.entries.is_empty() || schedule.total_weight == 0 {
+    // No tick is consumed for an empty pool, matching the old early return.
+    let total_weight: usize = pool.iter().map(|c| c.weight).sum();
+    if pool.is_empty() || total_weight == 0 {
         return None;
     }
 
     let spread = rr.next_tick(alias).wrapping_mul(WEYL_STEP);
     #[allow(clippy::cast_possible_truncation)]
-    let pos = ((u128::from(spread) * schedule.total_weight as u128) >> 64) as usize;
+    let pos = ((u128::from(spread) * total_weight as u128) >> 64) as usize;
     let mut acc = 0;
-    for entry in &schedule.entries {
-        acc += entry.weight;
+    for candidate in pool {
+        acc += candidate.weight;
         if pos < acc {
-            return Some(entry.candidate);
+            return Some(candidate);
         }
     }
     // pos < total_weight guarantees a hit above; last is a safe fallback.
-    schedule.entries.last().map(|entry| entry.candidate)
+    pool.last().copied()
 }
 
-/// Pick a candidate for `alias` by proportional weighting.
+/// Place a turn among `candidates` by declared weight.
 ///
-/// Builds the schedule with [`weighted_schedule`] and draws from it with
-/// [`pick_from_schedule`], so routing consumes exactly the weights that are
-/// inspectable through the schedule seam. A caller that also reports those
-/// numbers (the proxy's debug line) calls the two seams itself rather than
-/// computing the schedule twice.
-pub fn select_candidate<'a>(
-    alias: &str,
+/// Draws from the schedule [`placement_schedule`] describes, so a caller that
+/// reports those numbers sees the weights the pick actually used.
+///
+/// Eligibility — a candidate that is demoted, and the busy/idle preference —
+/// is not consulted here yet; the tickets that add them extend this function
+/// rather than adding a second placement path.
+pub fn place<'a>(
     candidates: &'a [ResolvedCandidate],
-    tracker: &Tracker,
+    alias: &str,
     rr: &RoundRobinState,
-    k: f64,
-    mode: LatencyMode,
-) -> Option<&'a ResolvedCandidate> {
-    let schedule = weighted_schedule(candidates, tracker, k, mode);
-    pick_from_schedule(&schedule, alias, rr)
+) -> Option<Placed<'a>> {
+    let pool: Vec<&ResolvedCandidate> = candidates.iter().collect();
+    let candidate = pick_weighted(&pool, alias, rr)?;
+    Some(Placed {
+        candidate,
+        reason: Placement::FreshByWeight,
+    })
 }
 
 #[cfg(test)]

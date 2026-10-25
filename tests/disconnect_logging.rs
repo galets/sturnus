@@ -40,7 +40,6 @@ fn state_from_config(config_toml: &str) -> Arc<AppState> {
         tracker,
         rr_state,
         client: reqwest::Client::new(),
-        exploit_k: 3.0,
         gcp_token_provider: None,
         budget: BufferBudget::new(128 * 1024 * 1024, 32 * 1024 * 1024),
         metrics: Metrics::new(),

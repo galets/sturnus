@@ -92,7 +92,6 @@ fn state_for(config_toml: &str, client: reqwest::Client) -> Arc<AppState> {
         tracker,
         rr_state,
         client,
-        exploit_k: 3.0,
         gcp_token_provider: None,
         budget: BufferBudget::new(128 * 1024 * 1024, 32 * 1024 * 1024),
         metrics,

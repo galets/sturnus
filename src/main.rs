@@ -186,8 +186,6 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let exploit_k = config.routing.exploit_k;
-
     let (budget_bytes, budget_source) = config.routing.buffer_budget_bytes();
     let configured_max_body = config.routing.max_body_bytes;
     let budget = BufferBudget::new(budget_bytes, configured_max_body);
@@ -221,7 +219,6 @@ async fn main() -> anyhow::Result<()> {
         tracker,
         rr_state,
         client,
-        exploit_k,
         gcp_token_provider,
         budget,
         metrics,

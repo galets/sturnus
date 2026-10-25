@@ -1,17 +1,17 @@
-//! Observability of the routing decision: the weights `/status` reports, and
-//! the debug lines that make a routed request readable next to a pinned one.
+//! Observability of the routing decision: the declared weights `/status`
+//! reports, and the debug lines that make a routed request readable next to a
+//! pinned one.
 //!
-//! The numbers asserted here are derived from the weighting formula in
-//! `src/router.rs`, not from whatever the endpoint happened to print:
+//! The numbers asserted here are the declared weights and the shares they
+//! imply, from `src/router.rs`:
 //!
 //! ```text
-//! weight = round( (best_effective / its_effective)^exploit_k * 1000 )
-//!          clamped to at least 1000 * 0.01 = 10   (the probe floor)
-//! share  = weight / sum(weights)
+//! share = weight / sum(weights)
 //! ```
 //!
-//! with `effective = latency_ewma / success_rate_ewma` for the request's
-//! latency mode. `exploit_k` defaults to 3.0.
+//! Nothing measured enters that arithmetic. The second test here is the one
+//! that proves it: a candidate that is warmed, then fails fifty times in a
+//! row, keeps exactly the share its weight declares.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -31,8 +31,8 @@ use sturnus::tracker::{LatencyMode, Tracker};
 mod common;
 use common::{capture_logs, wait_for_log, CapturedLogs};
 
-/// One alias, two candidates. The upstream addresses are only used by the
-/// tests that actually proxy something.
+/// One alias, two candidates at declared weights 2 and 1. The upstream
+/// addresses are only used by the tests that actually proxy something.
 const TWO_CANDIDATES: &str = r#"
 [provider.fast]
 base_url = "http://127.0.0.1:9"
@@ -44,8 +44,8 @@ api_key = "fake"
 
 [model]
 test = [
-  { provider = "fast", model = "m-fast" },
-  { provider = "slow", model = "m-slow" },
+  { provider = "fast", model = "m-fast", weight = 2 },
+  { provider = "slow", model = "m-slow", weight = 1 },
 ]
 "#;
 
@@ -65,7 +65,6 @@ fn state_from_config(config_toml: &str) -> Arc<AppState> {
         tracker,
         rr_state,
         client: reqwest::Client::new(),
-        exploit_k: 3.0,
         gcp_token_provider: None,
         budget: BufferBudget::new(128 * 1024, 32 * 1024 * 1024),
         metrics: Metrics::new(),
@@ -75,16 +74,14 @@ fn state_from_config(config_toml: &str) -> Arc<AppState> {
 }
 
 /// Serve `state` until the returned sender is dropped or fired.
-fn start_server(state: Arc<AppState>) -> (std::net::SocketAddr, oneshot::Sender<()>) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+async fn start_server(state: Arc<AppState>) -> (std::net::SocketAddr, oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let listener = TcpListener::from_std(listener).unwrap();
-    let (tx, rx) = oneshot::channel::<()>();
+    let (tx, rx) = oneshot::channel();
     tokio::spawn(run_server(
         listener,
         state,
-        async {
+        async move {
             let _ = rx.await;
         },
         Duration::from_secs(1),
@@ -92,9 +89,8 @@ fn start_server(state: Arc<AppState>) -> (std::net::SocketAddr, oneshot::Sender<
     (addr, tx)
 }
 
-/// One sample sets the latency EWMA to exactly that sample (a cold EWMA takes
-/// the first observation whole) and leaves the success-rate EWMA at 1.0, so
-/// the effective latency is exactly `ms` in both modes.
+/// Warm both latency EWMAs of `provider` to `ms` (one sample at alpha 0.3
+/// leaves the success-rate EWMA at 1.0).
 fn warm(state: &AppState, provider: &str, ms: u64) {
     let candidate = state
         .model_map
@@ -110,8 +106,7 @@ fn warm(state: &AppState, provider: &str, ms: u64) {
     }
 }
 
-/// `times` failures and no successes: at alpha 0.3 the success-rate EWMA is
-/// `0.7^times`, so 50 of them land under the `MIN_SUCCESS_RATE` clamp.
+/// `times` failures and no successes against `provider`.
 fn fail(state: &AppState, provider: &str, times: usize) {
     let candidate = state
         .model_map
@@ -127,7 +122,7 @@ fn fail(state: &AppState, provider: &str, times: usize) {
 
 /// `GET /status` parsed as JSON.
 async fn status_body(state: Arc<AppState>) -> serde_json::Value {
-    let (addr, _shutdown) = start_server(state);
+    let (addr, _shutdown) = start_server(state).await;
     let resp = reqwest::get(format!("http://{addr}/status")).await.unwrap();
     assert_eq!(resp.status(), 200);
     let content_type = resp
@@ -153,15 +148,15 @@ fn row<'a>(body: &'a serde_json::Value, provider: &str) -> &'a serde_json::Value
         .unwrap_or_else(|| panic!("no /status row for {provider}: {body}"))
 }
 
-/// A 2×-slower candidate gets `(1/2)^3 = 0.125` of the fastest candidate's
-/// weight, i.e. `0.125 / 1.125 = 1/9 ≈ 11.1%` of the traffic — the ~11% the
-/// ticket calls for, exactly. Both modes are warmed identically, so the two
-/// mode-specific schedules come out the same.
+fn share(row: &serde_json::Value) -> f64 {
+    row["routing"]["share"].as_f64().unwrap()
+}
+
+/// The declared weight is what the row reports, and the share is that weight
+/// over the alias's total.
 #[tokio::test]
-async fn status_reports_weight_share_and_effective_latency() {
+async fn status_reports_declared_weight_and_the_share_it_buys() {
     let state = state_from_config(TWO_CANDIDATES);
-    warm(&state, "fast", 100);
-    warm(&state, "slow", 200);
 
     let body = status_body(state).await;
 
@@ -169,112 +164,70 @@ async fn status_reports_weight_share_and_effective_latency() {
     let slow = row(&body, "slow");
     assert_eq!(fast["alias"], "test");
     assert_eq!(fast["model"], "m-fast");
-    assert_eq!(fast["status"], "warm");
-    // The pre-existing numbers are untouched.
-    assert_eq!(fast["streaming_ewma_ms"], 100);
-    assert_eq!(fast["nonstreaming_ewma_ms"], 100);
-    assert_eq!(fast["error_rate"], 0.0);
 
-    for mode in ["streaming", "nonstreaming"] {
-        let fast_route = &fast["routing"][mode];
-        let slow_route = &slow["routing"][mode];
+    assert_eq!(fast["routing"]["weight"], 2);
+    assert_eq!(slow["routing"]["weight"], 1);
+    assert!((share(fast) - 2.0 / 3.0).abs() < 1e-9, "fast share: {fast}");
+    assert!((share(slow) - 1.0 / 3.0).abs() < 1e-9, "slow share: {slow}");
+    assert!(
+        (share(fast) + share(slow) - 1.0).abs() < 1e-9,
+        "shares must be normalised"
+    );
 
-        assert_eq!(fast_route["weight"], 1000, "(100/100)^3 * 1000");
-        assert_eq!(slow_route["weight"], 125, "(100/200)^3 * 1000");
-        assert_eq!(fast_route["effective_latency_ms"], 100.0);
-        assert_eq!(slow_route["effective_latency_ms"], 200.0);
-
-        let fast_share = fast_route["share"].as_f64().unwrap();
-        let slow_share = slow_route["share"].as_f64().unwrap();
-        assert!(
-            (fast_share - 1000.0 / 1125.0).abs() < 1e-9,
-            "{mode} fast share {fast_share} should be 1000/1125 = 8/9"
-        );
-        assert!(
-            (slow_share - 125.0 / 1125.0).abs() < 1e-9,
-            "{mode} slow share {slow_share} should be 125/1125 = 1/9 ≈ 11%"
-        );
-        assert!(
-            (fast_share + slow_share - 1.0).abs() < 1e-9,
-            "shares must be normalised, sum was {}",
-            fast_share + slow_share
-        );
-    }
+    // Live load is reported beside the health fields, not as a schedule number.
+    assert_eq!(fast["in_flight"], 0, "nothing is in flight: {fast}");
 }
 
-/// A candidate that has stopped working entirely is not dropped from the
-/// schedule: it keeps the probe floor. Equal-latency candidates, then 50
-/// straight failures on "slow" — its success rate is clamped to
-/// `MIN_SUCCESS_RATE` (1e-3), so its effective latency is 100_000ms and its
-/// raw weight `(100/100_000)^3 * 1000 ≈ 1e-6` rounds to nothing and is clamped
-/// to `WEIGHT_RESOLUTION * PROBE_FLOOR` = 10. Share = `10 / 1010` ≈ 0.99%.
+/// The measured allocator is gone: warming a candidate to 100ms, warming its
+/// twin to 400ms, and then failing the twin fifty times moves no share at all.
+///
+/// This is the non-vacuity test for "the declared weight is the sole
+/// allocator". Under the arithmetic this design deleted, the same inputs moved
+/// the slow candidate's share from 33.3% to ~1% (latency) and then to the
+/// probe floor (errors); here the numbers cannot budge.
 #[tokio::test]
-async fn status_shows_a_candidate_sitting_at_the_probe_floor() {
+async fn measured_latency_and_errors_do_not_move_the_share() {
     let state = state_from_config(TWO_CANDIDATES);
+    let before = status_body(state.clone()).await;
+    let (fast_before, slow_before) = (share(row(&before, "fast")), share(row(&before, "slow")));
+
     warm(&state, "fast", 100);
-    warm(&state, "slow", 100);
+    warm(&state, "slow", 400);
     fail(&state, "slow", 50);
 
-    let body = status_body(state).await;
+    let after = status_body(state).await;
+    let (fast_after, slow_after) = (share(row(&after, "fast")), share(row(&after, "slow")));
 
-    let fast = row(&body, "fast");
-    let slow = row(&body, "slow");
-    assert_eq!(slow["status"], "degraded", "error EWMA is over threshold");
+    assert_eq!(
+        fast_before, fast_after,
+        "a declared share moved because latency did"
+    );
+    assert_eq!(
+        slow_before, slow_after,
+        "a declared share moved because errors did"
+    );
+    assert!((fast_after - 2.0 / 3.0).abs() < 1e-9);
 
-    for mode in ["streaming", "nonstreaming"] {
-        let slow_route = &slow["routing"][mode];
-        assert_eq!(slow_route["weight"], 10, "clamped to the probe floor");
-        let share = slow_route["share"].as_f64().unwrap();
-        assert!(
-            (share - 10.0 / 1010.0).abs() < 1e-9,
-            "{mode} floored share {share} should be 10/1010"
-        );
-        assert!(
-            (0.009..=0.011).contains(&share),
-            "a floored candidate should read ≈1% in {mode}, got {share}"
-        );
-        // Still scheduled, still probing: it is how it wins traffic back.
-        assert!(
-            fast["routing"][mode]["share"].as_f64().unwrap() > 0.98,
-            "the healthy candidate keeps the rest"
-        );
-    }
+    // The measurements are still reported — the operator can see the box that
+    // got slow, which is the detection this design hands back to a human.
+    let slow = row(&after, "slow");
+    assert_eq!(slow["observed"]["streaming_ewma_ms"], 400);
+    assert!(slow["observed"]["error_rate"].as_f64().unwrap() > 0.9);
 }
 
-/// A candidate with no latency data yet is not starved either: it probes at
-/// `COLD_PROBE_WEIGHT` (0.25) of the best candidate's rate, so 250 of
-/// `1000 + 250` units = 20%, and it reports no effective latency.
+/// The measured numbers say out loud that they do not route, so a reader of
+/// `/status` cannot conclude from a 400ms EWMA that the router knows about it.
 #[tokio::test]
-async fn status_shows_a_cold_candidate_as_a_probe() {
-    let state = state_from_config(TWO_CANDIDATES);
-    warm(&state, "fast", 100);
+async fn the_measured_numbers_are_labelled_as_not_used_for_routing() {
+    let body = status_body(state_from_config(TWO_CANDIDATES)).await;
+    let observed = &row(&body, "fast")["observed"];
 
-    let body = status_body(state).await;
-
-    let fast = row(&body, "fast");
-    let slow = row(&body, "slow");
-    assert_eq!(fast["status"], "warm");
-    assert_eq!(slow["status"], "cold");
-    assert!(slow["streaming_ewma_ms"].is_null());
-
-    for mode in ["streaming", "nonstreaming"] {
-        let fast_route = &fast["routing"][mode];
-        let slow_route = &slow["routing"][mode];
-        assert_eq!(
-            fast_route["weight"], 1000,
-            "the only warm candidate is the reference"
-        );
-        assert!(
-            slow_route["effective_latency_ms"].is_null(),
-            "a cold candidate has no effective latency to report"
-        );
-        assert_eq!(slow_route["weight"], 250, "cold probe weight");
-        let share = slow_route["share"].as_f64().unwrap();
-        assert!(
-            (share - 0.2).abs() < 1e-9,
-            "{mode} cold share {share} should be 250/1250 = 0.2"
-        );
-    }
+    assert_eq!(
+        observed["note"].as_str().unwrap(),
+        "measured, not used for routing: allocation is by declared weight"
+    );
+    // Cold: no sample yet, so the field is null rather than a sentinel.
+    assert!(observed["streaming_ewma_ms"].is_null(), "{observed}");
 }
 
 /// Mock upstream that keeps answering, so whichever candidate the router picks
@@ -291,7 +244,7 @@ async fn eager_upstream() -> (u16, tokio::task::JoinHandle<()>) {
     (port, handle)
 }
 
-/// Two candidates at a 1:2 latency ratio for the alias `fast`.
+/// Two live upstreams for the alias `fast`, weights 2 and 1.
 async fn two_candidate_state() -> (Arc<AppState>, Vec<tokio::task::JoinHandle<()>>) {
     let (port_alpha, alpha) = eager_upstream().await;
     let (port_beta, beta) = eager_upstream().await;
@@ -307,40 +260,21 @@ api_key = "fake"
 
 [model]
 fast = [
-  {{ provider = "alpha", model = "m-alpha" }},
-  {{ provider = "beta", model = "m-beta" }},
+  {{ provider = "alpha", model = "m-alpha", weight = 2 }},
+  {{ provider = "beta", model = "m-beta", weight = 1 }},
 ]
 "#
     ));
-    let candidates = state.model_map.get("fast").unwrap();
-    let alpha_idx = candidates
-        .iter()
-        .find(|c| c.provider_name == "alpha")
-        .unwrap()
-        .stats_index;
-    let beta_idx = candidates
-        .iter()
-        .find(|c| c.provider_name == "beta")
-        .unwrap()
-        .stats_index;
-    for mode in [LatencyMode::Streaming, LatencyMode::NonStreaming] {
-        state
-            .tracker
-            .record_success(alpha_idx, mode, Duration::from_millis(100));
-        state
-            .tracker
-            .record_success(beta_idx, mode, Duration::from_millis(200));
-    }
     (state, vec![alpha, beta])
 }
 
 /// The routing decision is auditable at debug: which alias, which candidate
-/// won, and what every candidate was worth.
+/// won, why, and what every candidate's declared weight buys it.
 #[tokio::test(flavor = "current_thread")]
-async fn routed_request_logs_every_candidates_share() {
+async fn routed_request_logs_the_reason_and_the_declared_shares() {
     let logs = CapturedLogs::default();
     let (state, upstreams) = two_candidate_state().await;
-    let (addr, _shutdown) = start_server(state);
+    let (addr, _shutdown) = start_server(state).await;
 
     capture_logs(logs.clone(), async move {
         let resp = reqwest::Client::new()
@@ -372,15 +306,19 @@ async fn routed_request_logs_every_candidates_share() {
             line.contains(&format!("provider={chosen}")),
             "the chosen candidate ({chosen}) should be logged: {line}"
         );
-        // Every candidate's share at the default sharpness: 1000/1125 and
-        // 125/1125, i.e. 88.9% and 11.1%.
         assert!(
-            line.contains("alpha/m-alpha=88.9%"),
-            "alpha's share missing: {line}"
+            line.contains(r#"reason="fresh-by-weight""#),
+            "the placement reason is missing: {line}"
+        );
+        // Declared weights 2:1, so the shares are 66.7% and 33.3% — the split
+        // the config declares, not one derived from measured latency.
+        assert!(
+            line.contains("alpha/m-alpha=66.7%"),
+            "alpha's declared share missing: {line}"
         );
         assert!(
-            line.contains("beta/m-beta=11.1%"),
-            "beta's share missing: {line}"
+            line.contains("beta/m-beta=33.3%"),
+            "beta's declared share missing: {line}"
         );
     })
     .await;
@@ -390,13 +328,14 @@ async fn routed_request_logs_every_candidates_share() {
     }
 }
 
-/// A request that rides a session-affinity pin never reaches the router, and
-/// its log line says so rather than pretending to be a decision.
+/// A request that rides an explicit pin bypasses the placement path, and its
+/// log line names the pin as the reason rather than pretending to be a
+/// weighted choice.
 #[tokio::test(flavor = "current_thread")]
-async fn honored_pin_logs_a_pin_not_a_routing_decision() {
+async fn an_explicit_pin_logs_the_pin_as_its_reason() {
     let logs = CapturedLogs::default();
     let (state, upstreams) = two_candidate_state().await;
-    let (addr, _shutdown) = start_server(state);
+    let (addr, _shutdown) = start_server(state).await;
 
     capture_logs(logs.clone(), async move {
         let resp = reqwest::Client::new()
@@ -414,14 +353,17 @@ async fn honored_pin_logs_a_pin_not_a_routing_decision() {
                 .to_str()
                 .unwrap(),
             "beta",
-            "the pin must win over the faster candidate"
+            "the pin must win over the weight-preferred candidate"
         );
 
-        let text = wait_for_log(&logs, Duration::from_secs(3), |t| t.contains("pin honored")).await;
+        let text = wait_for_log(&logs, Duration::from_secs(3), |t| {
+            t.contains(r#"reason="explicit-pin""#)
+        })
+        .await;
         let line = text
             .lines()
-            .find(|line| line.contains("pin honored"))
-            .unwrap_or_else(|| panic!("no pin line in:\n{text}"));
+            .find(|line| line.contains(r#"reason="explicit-pin""#))
+            .unwrap_or_else(|| panic!("no explicit-pin line in:\n{text}"));
         assert!(line.contains("alias=fast"), "alias missing: {line}");
         assert!(
             line.contains("provider=beta"),
@@ -431,14 +373,9 @@ async fn honored_pin_logs_a_pin_not_a_routing_decision() {
             line.contains("model=m-beta"),
             "the pinned model should be named: {line}"
         );
-
         assert!(
-            !text.contains("routing decision"),
-            "a pin is not a routing decision:\n{text}"
-        );
-        assert!(
-            !text.contains("shares="),
-            "a pinned request consulted no schedule:\n{text}"
+            !line.contains(r#"reason="fresh-by-weight""#),
+            "a pin is not a weighted placement:\n{text}"
         );
     })
     .await;
