@@ -220,7 +220,7 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
       "provider": "groq",
       "routing": {
         "nonstreaming": { "effective_latency_ms": 402.0, "share": 0.10393258426966293, "weight": 37 },
-        "streaming":    { "effective_latency_ms": 393.0, "share": 0.11280487804878048, "weight": 37 }
+        "streaming":    { "effective_latency_ms": 393.0, "share": 0.11280487804878049, "weight": 37 }
       },
       "status": "warm",
       "streaming_ewma_ms": 131
@@ -247,7 +247,7 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
       "nonstreaming_ewma_ms": 113,
       "provider": "local",
       "routing": {
-        "nonstreaming": { "effective_latency_ms": 470.6372344856311, "share": 0.06460674157303371, "weight": 23 },
+        "nonstreaming": { "effective_latency_ms": 470.63723448563115, "share": 0.06460674157303371, "weight": 23 },
         "streaming":    { "effective_latency_ms": null, "share": 0.03048780487804878, "weight": 10 }
       },
       "status": "degraded",
@@ -310,7 +310,7 @@ A honored pin bypasses the router completely, and says so at `debug` (`session a
 6. The `model` field is rewritten to the real model name, auth headers are set, and the request is forwarded.
 7. TTFC is measured at first chunk arrival and fed back into the EWMA; the response status (any non-2xx counts as an error, including upstream 4xx) feeds the success-rate EWMA.
 
-The best provider is exploited heavily while worse ones keep enough traffic to stay measured. A candidate's probe share shrinks with how bad it looks but is floored at 1%, so re-detecting a recovered provider costs at most ~100 requests — and during an outage at most ~1% of an alias's traffic is spent on the failing candidate.
+The best provider is exploited heavily while worse ones keep enough traffic to stay measured. A candidate's probe share shrinks with how bad it looks but is floored at 1%, so re-detecting a recovered provider costs at most ~100 requests — and during an outage at most ~1% of an alias's traffic is spent on the failing candidate, *while the healthy leader is unsaturated*. A leader saturated by its own queue falls to the same 10-unit floor the failing candidate sits at, and from there the two split the alias near evenly: 200 picks held open (so the picks are what load the leader) over a 100ms leader and an 800ms hard-failing box land `[101, 99]` — the same saturation `router::tests::a_loaded_leader_yields_traffic_to_an_idle_slower_candidate` drives.
 
 ### Exploit sharpness: `routing.exploit_k`
 

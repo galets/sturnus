@@ -141,8 +141,14 @@ their history lives in the git log and tags.
   table is built from, so the table, the floor and the cold probe are exactly
   where they were for an idle alias. One consequence worth knowing: the floor is
   now 1% of the load-free reference rather than 1% of whatever the best box had
-  shrunk to, so two fully saturated candidates split near evenly — a saturated
-  100ms leader and an idle 400ms box go from 75%/25% to 52%/48%.
+  shrunk to, so two fully saturated candidates split near evenly — a 100ms
+  leader and an idle 400ms box, over 100 picks held open so that the picks
+  themselves are what loads both boxes, go from 75%/25% to 52%/48%
+  (`router::tests::a_loaded_leader_yields_traffic_to_an_idle_slower_candidate`).
+  That is a walk, not a share table: the snapshot it walks towards is the
+  floor's own 10-vs-16 split, 38.5%/61.5%, and at the parent the matching
+  snapshot drifted with the queue depth instead of settling (88.9%/11.1% at one
+  request in flight).
 
 - **Benign caller disconnects no longer log at ERROR.** A caller that hangs up
   mid-request now appears at `debug` with its address and in the new

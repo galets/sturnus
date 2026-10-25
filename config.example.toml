@@ -82,14 +82,17 @@ connect_timeout_secs = 10  # max seconds to establish upstream connection
 read_timeout_secs = 60     # max seconds between chunks before treating upstream as hung
 
 # exploit_k is the exponent in each candidate's weight:
-# round(1000 * (best_effective / its_effective)^exploit_k), floored at 10 units
-# (1% of the best candidate's), where effective latency is the latency EWMA
-# over the success-rate EWMA, multiplied by (1 + in-flight requests) so a busy
-# candidate is scored on the wait it would impose. A candidate's share of its
-# alias is its weight over the alias's total weight. Nothing is in flight in the
-# table below: the queue factor is 1 at in_flight = 0, so each row is the split
-# between two idle candidates waiting to be compared. One carrying n requests is
-# scored (1 + n)x slower than its row and its share shrinks until it drains:
+# round(1000 * (reference / its_effective)^exploit_k), floored at 10 units (1%
+# of the reference), where `reference` is the alias's best *load-free* effective
+# latency — the smallest latency EWMA over the success-rate EWMA among its warm
+# candidates, with its queue taken out — and `its_effective` is this candidate's
+# same latency multiplied by (1 + in-flight requests). A busy candidate is
+# therefore scored on the wait it would impose, against a reference no
+# candidate's own queue can move. A candidate's share of its alias is its
+# weight over the alias's total weight. Nothing is in flight in the table
+# below: the queue factor is 1 at in_flight = 0, so each row is the split
+# between two idle candidates waiting to be compared. One carrying n requests
+# is scored (1 + n)x slower than its row and its share shrinks until it drains:
 #
 #   worse candidate    k = 3.0 (default)   k = 1.0    k = 0.0
 #   2x slower          11.1%               33.3%      50%

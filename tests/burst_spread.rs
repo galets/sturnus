@@ -589,15 +589,24 @@ fn logged_shares(logs: &CapturedLogs, alias: &str) -> Vec<String> {
 /// scored counts the first had already spent.
 ///
 /// The premise this rests on is that a reservation *changes* the shares it
-/// reports, and that is only true of a scoring reference that does not move
-/// with the candidate being scored. Both boxes here are warmed to the same
+/// reports, and that is only guaranteed by a scoring reference that does not
+/// move with the candidate being scored. Both boxes here are warmed to the same
 /// sample, so the second pick's snapshot is 125/1000 against the first's
-/// 1000/1000. Scored against the queue-inflated minimum instead, a reservation
-/// on the alias's best box leaves the shares byte-identical — a warmed leader
-/// against a cold twin reads 80.0%/20.0% at one request in flight and at none —
-/// and this assertion has nothing to check. That is why the pair is warmed:
-/// not to make the split happen, which the Weyl walk does anyway, but to make
-/// the line the assertion reads mean what the assertion says.
+/// 1000/1000. Scored against the queue-inflated minimum this pair happens to
+/// separate as well, and for a reason that has nothing to do with the leader:
+/// the reservation hands the minimum to the idle twin, so the leader falls to
+/// 125 against that twin's 1000. Byte-identical shares under the moving
+/// reference need a reserving box that is the alias's *sole warm candidate*. A
+/// warmed leader beside a cold twin is that minimum at every queue depth, so
+/// its own `(1 + n)` sits on both sides of its ratio and divides out, and the
+/// shares read 80.0%/20.0% at one request in flight and at none — the pair
+/// landing `[2, 0]`, four requests `[3, 1]`. That is the alias this file's own
+/// `a_warmed_leader_shares_a_burst_with_its_cold_twin` drives over HTTP, and
+/// the one `router::tests::a_warmed_leader_pays_for_its_queue_against_a_cold_probe`
+/// drives at the seam: it fails at `9484fd8`, with the leader holding the full
+/// 1000 units at one request in flight. That is why the pair is
+/// warmed: not to make the split happen, which the Weyl walk does anyway, but
+/// to make the line the assertion reads mean what the assertion says.
 ///
 /// Sound for a pair only, and only because the two snapshots differ: a load
 /// that sits evenly on the alias renders as the same even split whether it is
