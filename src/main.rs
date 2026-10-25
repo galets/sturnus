@@ -22,7 +22,15 @@ enum LogFormat {
 }
 
 #[derive(Parser)]
-#[command(name = "sturnus", about = "Lightweight LLM load-balancing sidecar")]
+#[command(
+    name = "sturnus",
+    about = "Lightweight LLM load-balancing sidecar",
+    // From the manifest, so the flag, the banner and the startup log line all
+    // report what the release pipeline stamped. `--version`/`-V` is answered by
+    // clap during `parse()`, so it needs no logging, config, env file, or env
+    // dir: it works on a host whose config is what is broken.
+    version = sturnus::VERSION
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -64,14 +72,20 @@ fn print_banner() {
     if !std::io::stderr().is_terminal() {
         return;
     }
-    eprintln!(
+    eprintln!("{}", banner_text());
+}
+
+/// The banner text, kept out of `print_banner` so a test can check it names the
+/// same version the flag and the startup log line do.
+fn banner_text() -> String {
+    format!(
         "\n\
          \x20     ┌► llm\n\
          \x20  ►──┼► llm\n\
          \x20     └► llm\n\
          \x20  sturnus v{}\n",
-        env!("CARGO_PKG_VERSION")
-    );
+        sturnus::VERSION
+    )
 }
 
 fn init_logging(format: LogFormat) {
@@ -115,6 +129,12 @@ async fn run_healthcheck(port: u16) -> anyhow::Result<()> {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_logging(cli.log_format);
+    // The first line of every run, and deliberately before any config, env
+    // file, or env dir is touched: a startup that dies on a missing,
+    // unreadable, or invalid config has still said which binary tried and
+    // failed. The listen address is genuinely not knowable yet, so it stays on
+    // the line that binds the socket.
+    info!(version = sturnus::VERSION, "starting sturnus");
     sturnus::init_crypto();
 
     if let Some(Command::Healthcheck { port }) = &cli.command {
@@ -139,7 +159,6 @@ async fn main() -> anyhow::Result<()> {
     };
     let config = sturnus::config::Config::load(&config_path)?;
 
-    info!(listen = %config.listen, "starting sturnus");
     info!(
         path = %config_path.display(),
         providers = config.provider.len(),
@@ -270,6 +289,16 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn flag_and_banner_report_the_one_version() {
+        // Flag, banner, and the startup log field all read `sturnus::VERSION`;
+        // the end-to-end test checks that constant against Cargo.toml. Compared
+        // whole, so a `+fork` stamp cannot be trimmed on the way to the output.
+        assert_eq!(Cli::command().get_version(), Some(sturnus::VERSION));
+        assert!(banner_text().contains(&format!("sturnus v{}", sturnus::VERSION)));
+    }
 
     #[test]
     fn config_is_optional_so_the_home_default_can_apply() {

@@ -70,6 +70,24 @@ their history lives in the git log and tags.
   latency-only routing notices only once latency has already degraded. A box
   reachable through several aliases reports the same number under each of its
   label sets, because it is one box's queue.
+- **`--version` (`-V`), and the version in the first log line.** `sturnus --version`
+  prints `sturnus <version>` on stdout and exits 0; it used to be rejected outright
+  with `error: unexpected argument '--version' found` and exit 2. The flag is
+  answered before logging is initialised and before any config, env file, or env dir
+  is touched, so it works on a box whose config is precisely what is broken, and it
+  prints the version whole: a fork stamped `5.3.0+galets2` reports `5.3.0+galets2`,
+  because that suffix is the difference between two builds a host has actually run.
+  The version is also a field of the first structured log line, emitted before the
+  config file is opened, so `journalctl -u sturnus` names the build it is running
+  with no flag at all — and a startup that dies on a missing, unreadable, or invalid
+  config has still said which binary tried and failed. The interactive banner keeps
+  showing the version and stays terminal-only, since log output is machine-read and a
+  banner would corrupt it: the journal case is answered by a real log field, not by
+  un-gating the banner. Flag, banner and log field all read one constant derived from
+  the package manifest — the source the release pipeline already treats as canonical,
+  a tag that disagrees with it fails the release — so the three cannot drift apart
+  across releases. The listen address, genuinely not knowable before the config is
+  read, is reported by the line that binds the socket.
 
 ### Changed
 

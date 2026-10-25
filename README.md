@@ -174,6 +174,21 @@ Sidecar keys take precedence over any client-supplied `labels` keys with the sam
 
 </details>
 
+### Command line
+
+| Flag | What it does |
+|------|--------------|
+| `--config <path>` (`-c`) | Config file to read. Defaults to `~/.config/sturnus.toml`. A repeated `--config` replaces the earlier one, which is how the container image's built-in `--config /config.toml` stays overridable. |
+| `--env-file <path>` | Load a `.env` file (`KEY=VALUE` per line) into the process environment before the config is read, so `${VAR}` interpolation finds it. |
+| `--env-dir <dir>` | Load env vars from a directory of secret files — filename is the key, content the value, the layout Docker and Kubernetes secret mounts produce. Overwrites existing vars, so mounted secrets win. Hidden files and subdirectories are skipped. |
+| `--log-format <auto\|pretty\|json>` | Log format. `auto` (the default) is coloured text on a terminal and JSON when piped or redirected. Also settable with `STURNUS_LOG_FORMAT`. |
+| `--version` (`-V`) | Print `sturnus <version>` to stdout and exit 0. |
+| `--help` (`-h`) | List the flags above (`-h` for a summary). |
+
+`--version` is answered before logging is initialised and before any config, env file, or env dir is touched, so it works on a host whose config is precisely what is broken. It prints the version whole, build metadata included: a fork stamped `5.3.0+galets2` reports `5.3.0+galets2`. The version comes from the package manifest — the same source the release pipeline checks the tag against — so the flag, the startup log line, and the interactive banner cannot drift apart.
+
+The one subcommand is `sturnus healthcheck --port <port>`: it probes a running instance's `/health` and exits non-zero when the instance is unhealthy, which is what the container image's health probe runs.
+
 ## Endpoints
 
 | Method | Path | Description |
@@ -267,6 +282,8 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
 ### Logging
 
 Structured logging via `tracing`: coloured text on a terminal (respecting `NO_COLOR`), newline-delimited JSON when piped or redirected. Set the format with `--log-format <auto|pretty|json>` (or `STURNUS_LOG_FORMAT`) and the level with `RUST_LOG` (default `sturnus=info`).
+
+The first line of every run names the build — `starting sturnus version=5.3.0+galets2`, a `version` field in JSON — and is emitted before the config file is opened, so a startup that fails on a missing, unreadable, or invalid config has still said which binary tried and failed. That is what makes `journalctl -u sturnus` answer "which build is this?" with no flag, including for a process that dies during startup: the interactive banner stays terminal-only, because log output is machine-read and a banner would corrupt it. The listen address is not knowable before the config is read, so it is reported by the line that binds the socket (`listening addr=127.0.0.1:4000`).
 
 Each request gets a span with a `request_id`; a client-supplied W3C `traceparent` propagates as `trace_id` and `parent_span_id` for cross-service correlation.
 
