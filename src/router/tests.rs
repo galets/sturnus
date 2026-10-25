@@ -168,10 +168,14 @@ fn a_loaded_leader_yields_traffic_to_an_idle_slower_candidate() {
     // Fast is 4x quicker, so its idle weight is 4^3 = 16 to 1 — 98.4% of
     // traffic. Hold every stream open so the in-flight counts stay where the
     // picks put them, and the leader's own queue has to be what stops it:
-    // weight (1/(0.1 + 0.1n))^3 against (1/0.4)^3. At n=3 the two are equal, so
-    // from there the idle candidate wins the majority, and it never has to wait
-    // for the EWMA to notice that the leader slowed down — the EWMA still
-    // reports the pristine 100 ms, because nothing has finished yet.
+    // weight (1/(1 + n))^3 · 1000 against the idle candidate's 16, both priced
+    // against the load-free 100ms. The two cross at n = 3, where a request
+    // expects the same 400ms on either box, and past n = 4 the leader is at the
+    // probe floor with the idle candidate just above it, so the converged split
+    // is close to the floor's even one — ~half the alias, against the 1.6% the
+    // idle arithmetic gives that box. It never has to wait for the EWMA to
+    // notice that the leader slowed down: the EWMA still reports the pristine
+    // 100 ms, because nothing has finished yet.
     let (candidates, tracker, rr) = setup(&[("fast", "m1"), ("slow", "m2")]);
     for c in &candidates {
         tracker.record_success(
@@ -180,6 +184,11 @@ fn a_loaded_leader_yields_traffic_to_an_idle_slower_candidate() {
             Duration::from_millis(if c.provider_name == "fast" { 100 } else { 400 }),
         );
     }
+
+    // The share the idle arithmetic gives the slower box, for the comparison
+    // at the end: 16 units against the leader's 1000, i.e. 1.6% of the alias.
+    let idle_slow_share =
+        weighted_schedule(&candidates, &tracker, 3.0, LatencyMode::Streaming).entries[1].share;
 
     // Warm the tick, then spend it on a throwaway request, so the burst below
     // starts its walk from a point where the idle candidate is due.
@@ -217,9 +226,22 @@ fn a_loaded_leader_yields_traffic_to_an_idle_slower_candidate() {
     }
     let slow_share = f64::from(slow) / n as f64;
     assert!(
-        (0.20..=0.40).contains(&slow_share),
+        (0.40..=0.60).contains(&slow_share),
         "a saturated 4x-faster leader should give the idle candidate its \
-         converged share (~0.25), got {slow_share:.2}"
+         converged share (~0.5, floor-bound at this depth), got {slow_share:.2}"
+    );
+    assert!(
+        slow_share > 10.0 * idle_slow_share,
+        "…which is more than ten times the {:.1}% the idle weighting gives that candidate, \
+         got {slow_share:.2}",
+        idle_slow_share * 100.0
+    );
+    assert_eq!(
+        tracker
+            .stats(candidates[0].stats_index)
+            .ewma_ms(LatencyMode::Streaming),
+        100,
+        "…and none of it came from the latency EWMA, which nothing has been able to move"
     );
 }
 
@@ -901,6 +923,326 @@ fn a_busy_alias_still_floors_its_worst_candidate() {
     assert!(
         schedule.entries[1].share < schedule.entries[0].share,
         "and still ranked far below the healthy one"
+    );
+    drop(guards);
+}
+
+// --- The scoring reference -------------------------------------------------
+//
+// Every weight is a ratio over one reference latency, and the reference has to
+// be load-free for the queue term to mean anything: `best` taken over the
+// *queue-adjusted* latencies puts a candidate's own `(1 + n)` in the numerator
+// and the denominator of its own weight, where it cancels, so the alias's
+// leader — the one candidate the queue term exists to penalise — sits at a
+// full 1000 units however deep its queue gets. The four tests below are that
+// claim, measured. At the commit this section was written against
+// (`9484fd8`) they read instead: leader 1000 against a cold twin's 250 for
+// n = 1, 2, 3, i.e. 80% of the alias held by a box carrying the burst, an
+// eight-request burst landing `[6, 1, 0, 1]`, and a 4x-faster leader holding
+// 1000 units against a warmed twin right up to the queue where its inflated
+// latency stopped being the alias's minimum.
+
+/// The case the queue term is for: a warmed leader with a real EWMA lead and a
+/// cold twin. The leader's queue has to be what moves traffic here — nothing
+/// else about it changed — and for that the reference must not move with it.
+#[test]
+fn a_warmed_leader_pays_for_its_queue_against_a_cold_probe() {
+    let (candidates, tracker, _rr) = setup(&[("leader", "m1"), ("cold", "m2")]);
+    tracker.record_success(
+        candidates[0].stats_index,
+        LatencyMode::Streaming,
+        Duration::from_millis(100),
+    );
+
+    // Idle: the leader is the reference, so it holds the full 1000 units and
+    // the cold twin probes at its quarter. This is the split the docs promise,
+    // and the fix leaves it exactly where it was.
+    let idle = weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+    assert_eq!(idle.entries[0].weight, 1000);
+    assert_eq!(idle.entries[1].weight, 250);
+    assert!((idle.entries[0].share - 0.8).abs() < 1e-12);
+
+    // One request on the leader: effective latency 200ms, reference still the
+    // 100ms it measured, so weight (100/200)^3 = 125. One request costs the
+    // leader 8x of its weight — and the cold twin's probe is 250 units of that
+    // same load-free reference, so the leader is now the *minority* of its own
+    // alias at 125/375 = 33.3%.
+    let mut guards = Vec::new();
+    guards.push(tracker.dispatch(candidates[0].stats_index));
+    let one = weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+    assert_eq!(one.entries[0].effective_latency_ms, Some(200.0));
+    assert_eq!(
+        one.entries[0].weight, 125,
+        "the leader pays (1 + 1)^3 = 8x of its weight for the one request it is carrying"
+    );
+    assert_eq!(
+        one.entries[1].weight, 250,
+        "the cold probe is denominated in the reference, not in the leader's queue"
+    );
+    assert!(
+        (one.entries[0].share - 125.0 / 375.0).abs() < 1e-12,
+        "the leader is a third of its own alias, got {}",
+        one.entries[0].share
+    );
+    assert!(
+        one.entries[0].share < one.entries[1].share,
+        "a cold twin outranks a leader carrying one request; got {} vs {}",
+        one.entries[0].share,
+        one.entries[1].share
+    );
+
+    // It keeps paying, monotonically: 1/n+1 cubed against a probe that does
+    // not move, so 33% then 13% then 6%. At the parent commit this row is
+    // 1000/250 — 80% — at every n, because the leader's inflated latency was
+    // itself the minimum the ratios were taken against.
+    let mut previous = one.entries[0].share;
+    for (n, expected_weight) in [(2, 37), (3, 16)] {
+        guards.push(tracker.dispatch(candidates[0].stats_index));
+        let loaded = weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+        assert_eq!(
+            loaded.entries[0].effective_latency_ms,
+            Some(100.0 * (f64::from(n) + 1.0))
+        );
+        assert_eq!(loaded.entries[0].weight, expected_weight, "n = {n}");
+        assert_eq!(loaded.entries[1].weight, 250, "n = {n}");
+        assert!(
+            loaded.entries[0].share < previous,
+            "the leader's share falls as its queue grows, n = {n}"
+        );
+        previous = loaded.entries[0].share;
+    }
+
+    // And it is the *queue* that cost it the weight, not the latency: drop the
+    // guards and the arithmetic is the idle one again, bit for bit.
+    drop(guards);
+    let drained = weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+    assert_eq!(drained.entries[0].weight, idle.entries[0].weight);
+    assert!((drained.entries[0].share - idle.entries[0].share).abs() < 1e-12);
+}
+
+/// The same leader under a burst — eight concurrent requests over one warmed
+/// box and three cold twins, every guard held to the end of the scope. The
+/// leader is where a latency-only router puts all eight and where a
+/// queue-adjusted score with a moving reference also puts nearly all of them,
+/// because the leader stays at 1000 units the whole way; measured at the parent
+/// commit this burst landed `[6, 1, 0, 1]` — one cold twin never got a request
+/// at all.
+#[test]
+fn a_warmed_leader_spreads_a_burst_over_its_cold_twins() {
+    let (candidates, tracker, rr) = setup(&[
+        ("leader", "m1"),
+        ("cold1", "m2"),
+        ("cold2", "m3"),
+        ("cold3", "m4"),
+    ]);
+    tracker.record_success(
+        candidates[0].stats_index,
+        LatencyMode::Streaming,
+        Duration::from_millis(100),
+    );
+
+    let mut counts = vec![0usize; candidates.len()];
+    let mut held = Vec::with_capacity(8);
+    for _ in 0..8 {
+        let dispatch = select_and_dispatch(
+            "test",
+            &candidates,
+            &tracker,
+            &rr,
+            EXPLOIT_K,
+            LatencyMode::Streaming,
+        )
+        .expect("the alias has candidates");
+        counts[dispatch.candidate.stats_index] += 1;
+        held.push(dispatch);
+    }
+
+    let leader = counts[0];
+    let spread = counts.iter().max().unwrap_or(&0) - counts.iter().min().unwrap_or(&0);
+    assert!(
+        leader <= 3,
+        "a leader carrying the burst's earlier requests should lose weight to its idle \
+         twins, got {counts:?} with {leader} of 8 on the leader",
+    );
+    assert!(
+        counts.iter().all(|count| *count >= 1),
+        "the cold twins are probed while the leader is busy, got {counts:?}",
+    );
+    assert!(
+        spread <= 2,
+        "eight requests over four boxes should not leave one box at a fifth of another, got \
+         {counts:?}",
+    );
+    for (candidate, count) in candidates.iter().zip(&counts) {
+        assert_eq!(
+            tracker.in_flight(candidate.stats_index),
+            *count,
+            "the picks held their reservations, so the distribution is the live queue"
+        );
+    }
+}
+
+/// A leader with a real lead over a *warmed* twin, so the twin cannot be the
+/// reference either: 100ms against 400ms is 1000 to 16 idle. Reserving on the
+/// leader walks its weight down 125, 37, 16 — the point where the two boxes
+/// expect the same wait — and under it, at which point the idle box is the
+/// shorter wait and the alias splits. At the parent commit the leader held the
+/// full 1000 at n = 1, 2 and 3: its inflated latency was the alias's minimum
+/// right up to 4 × 100ms equalling the twin's 400ms. Its share moved only
+/// because the twin's weight climbed to meet it — 125, 422, 1000 — the queue
+/// appearing as the follower getting cheaper rather than the leader getting
+/// dearer, with the leader still taking 70% of the alias at two requests in
+/// flight.
+#[test]
+fn a_warmed_leader_pays_for_its_queue_against_a_warmed_twin() {
+    let (candidates, tracker, _rr) = setup(&[("leader", "m1"), ("slow", "m2")]);
+    tracker.record_success(
+        candidates[0].stats_index,
+        LatencyMode::Streaming,
+        Duration::from_millis(100),
+    );
+    tracker.record_success(
+        candidates[1].stats_index,
+        LatencyMode::Streaming,
+        Duration::from_millis(400),
+    );
+
+    let idle = weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+    assert_eq!(idle.entries[0].weight, 1000);
+    assert_eq!(idle.entries[1].weight, 16, "(100/400)^3 · 1000");
+    assert!(idle.entries[0].share > 0.98, "a 4x lead is 98% idle");
+
+    let mut guards = Vec::new();
+    let mut previous_weight = idle.entries[0].weight;
+    for (n, expected_leader_weight) in [(1, 125), (2, 37), (3, 16), (4, 10)] {
+        guards.push(tracker.dispatch(candidates[0].stats_index));
+        let loaded = weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+        assert_eq!(
+            loaded.entries[0].weight, expected_leader_weight,
+            "the leader's weight at n = {n} is its own queue priced against the load-free 100ms"
+        );
+        assert_eq!(
+            loaded.entries[1].weight, 16,
+            "the idle twin is untouched by it"
+        );
+        assert!(
+            loaded.entries[0].weight < previous_weight,
+            "the leader's weight falls with every request routed to it, n = {n}"
+        );
+        if n == 1 {
+            // A real lead is still worth having at one request: `(1 + 1)·100ms`
+            // really is the shorter wait next to 400ms, and the queue term
+            // prices the wait rather than vetoing the lead.
+            assert!(
+                loaded.entries[0].share > 0.85,
+                "one request does not hand a 4x-slower box the alias, got {}",
+                loaded.entries[0].share
+            );
+        }
+        previous_weight = loaded.entries[0].weight;
+    }
+
+    // Four requests on a 4x-faster box and it is the *worse* of its own alias:
+    // the queue term outruns the lead, which is the property the ticket asked
+    // for and the one the parent commit could not express at all.
+    let loaded = weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+    assert!(
+        loaded.entries[0].share < 0.5,
+        "a leader four requests deep is the minority of its own alias, got {}",
+        loaded.entries[0].share
+    );
+    drop(guards);
+}
+
+/// What the reference choice cannot do, pinned so the tests above are read as
+/// being about the reference and not about the ratio: scaling every weight by
+/// one constant leaves every share alone, so between two *warm* candidates the
+/// old reference and the new one agree whenever a warm candidate is the
+/// alias's minimum. Two warmed 100ms boxes therefore already spread a pick at
+/// the parent commit — the idle twin was the alias's minimum there, so it was
+/// already the yardstick, and this test passes there. It is the cold probe, the
+/// probe floor, and a leader that *is* the alias's minimum where the two
+/// references part company, and that is what the tests above drive.
+#[test]
+fn an_idle_warmed_twin_is_already_the_reference() {
+    let (candidates, tracker, _rr) = setup(&[("leader", "m1"), ("twin", "m2")]);
+    for candidate in &candidates {
+        tracker.record_success(
+            candidate.stats_index,
+            LatencyMode::Streaming,
+            Duration::from_millis(100),
+        );
+    }
+
+    let idle = weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+    assert_eq!(idle.entries[0].weight, 1000);
+    assert_eq!(idle.entries[1].weight, 1000);
+
+    let guard = tracker.dispatch(candidates[0].stats_index);
+    let loaded = weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+    assert_eq!(loaded.entries[0].weight, 125);
+    assert_eq!(
+        loaded.entries[1].weight, 1000,
+        "the idle twin is the reference"
+    );
+    assert!(
+        (loaded.entries[0].share - 1.0 / 9.0).abs() < 1e-12,
+        "125 to 1000 is an eighth of the alias, got {}",
+        loaded.entries[0].share
+    );
+    drop(guard);
+}
+
+/// `PROBE_FLOOR` is 10 units *of the reference*, and the reference is now
+/// load-free, so the floor is a fixed probe rate rather than a share of
+/// traffic. For an idle alias that is ticket 04's ~1%; once the healthy box
+/// falls below the floor itself — a queue past 4.6x the alias's best load-free
+/// latency at the default sharpness — the floored candidate's share of the
+/// alias is much larger than 1%, because the floor is all the weighting has
+/// left to divide with. Pinned here so the docs cannot claim a 1% cap that the
+/// arithmetic does not have.
+#[test]
+fn the_probe_floor_is_one_percent_of_the_reference_not_of_the_alias() {
+    let (candidates, tracker, _rr) = setup(&[("good", "m1"), ("bad", "m2")]);
+    tracker.record_success(
+        candidates[0].stats_index,
+        LatencyMode::Streaming,
+        Duration::from_millis(100),
+    );
+    tracker.record_success(
+        candidates[1].stats_index,
+        LatencyMode::Streaming,
+        Duration::from_millis(100),
+    );
+    for _ in 0..50 {
+        tracker.record_error(candidates[1].stats_index);
+    }
+
+    let idle = weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+    assert_eq!(idle.entries[1].weight, 10);
+    assert!(
+        (idle.entries[1].share - 10.0 / 1010.0).abs() < 1e-12,
+        "an idle alias floors the failing box at ~1%, as documented"
+    );
+
+    // Three requests on the healthy box take it to 400ms of expected wait, a
+    // weight of 16, so the floored probe is a third of the alias: 10 units
+    // against 16. At the parent commit the leader was pinned at 1000 there and
+    // the probe stayed at 1%.
+    let guards: Vec<_> = (0..3)
+        .map(|_| tracker.dispatch(candidates[0].stats_index))
+        .collect();
+    let loaded = weighted_schedule(&candidates, &tracker, EXPLOIT_K, LatencyMode::Streaming);
+    assert_eq!(loaded.entries[0].weight, 16);
+    assert_eq!(loaded.entries[1].weight, 10, "the floor does not move");
+    assert!(
+        (loaded.entries[1].share - 10.0 / 26.0).abs() < 1e-12,
+        "the floored probe is 10 units of a 26-unit alias, got {}",
+        loaded.entries[1].share
+    );
+    assert!(
+        loaded.entries[1].share < loaded.entries[0].share,
+        "…and still ranked below the box that is merely busy"
     );
     drop(guards);
 }

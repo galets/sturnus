@@ -84,11 +84,16 @@ their history lives in the git log and tags.
   placed in the same instant never both see an idle box. A same-instant pair of
   requests against interchangeable boxes now splits one per box instead of
   queueing both on the current EWMA winner, while a genuinely slower box is
-  still avoided rather than load-balanced to. The adjustment is the exact
-  identity at `in_flight = 0`, so an idle alias routes on measured latency
-  alone and the proportional-share property is untouched: the share table
-  (2x-slower 11.1% at the default sharpness, probe floor 1%) is the split of
-  a *waiting* alias, and the floor still applies after the adjustment, so a
+  still avoided rather than load-balanced to. "Interchangeable" is doing work in
+  that sentence: it is the state the split follows *from*, and the state the
+  end-to-end test builds by warming every box to one identical sample. Boxes the
+  weighting cannot compare on latency — a candidate with no sample yet — are the
+  case this left broken, and the Fixed entry below is that. The adjustment is
+  the exact identity at `in_flight = 0`, so an idle alias routes on measured
+  latency alone and the proportional-share property is untouched: the share table
+  (2x-slower 11.1% at the default sharpness, probe floor 1%) is the split of an
+  *idle* alias — put load on a candidate and it leaves its row until its
+  responses finish — and the floor still applies after the adjustment, so a
   candidate that is slow *and* busy keeps its shrinking-but-nonzero share.
   Nothing oscillates either — the adjustment's only memory is the requests
   themselves, and each response that finishes decays one step back toward the
@@ -114,6 +119,30 @@ their history lives in the git log and tags.
 - The config path actually loaded is logged at startup.
 
 ### Fixed
+
+- **A candidate's queue no longer cancels out its own score.** The adjustment
+  above multiplied a candidate's effective latency by `(1 + n)`, but the ratio it
+  sat in was taken against the smallest *queue-adjusted* latency in the alias —
+  and when the candidate being scored is that minimum, its own `(1 + n)` appears
+  on both sides of its ratio and divides out. The alias's best box therefore kept
+  the full 1000 units however deep its own queue grew. Between two candidates the
+  formula scores, that was invisible: scaling every weight by one factor leaves
+  every share alone, which is why the even-alias bursts already spread. It showed
+  wherever a weight is *fixed* rather than computed — the cold probe's 250 units
+  and the probe floor's 10 — which is the common case of a healthy box beside one
+  that has never been measured: a warmed 100ms leader and its cold twin, four
+  same-instant requests, landed `[3, 1]` at `9484fd8`, every run. The reference
+  is now the
+  smallest *load-free* effective latency among the alias's warm candidates, so
+  the exponent acts on a numerator no candidate's queue can move. That leader is
+  worth 125 units at one request in flight, the cold probe outranks it, and the
+  same burst lands `[2, 2]`; at two requests it is 37 units, at three 16. Nothing
+  moves at `in_flight = 0`, where the reference is the same minimum the share
+  table is built from, so the table, the floor and the cold probe are exactly
+  where they were for an idle alias. One consequence worth knowing: the floor is
+  now 1% of the load-free reference rather than 1% of whatever the best box had
+  shrunk to, so two fully saturated candidates split near evenly — a saturated
+  100ms leader and an idle 400ms box go from 75%/25% to 52%/48%.
 
 - **Benign caller disconnects no longer log at ERROR.** A caller that hangs up
   mid-request now appears at `debug` with its address and in the new

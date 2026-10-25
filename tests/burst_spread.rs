@@ -1,5 +1,5 @@
 //! The same-instant burst, end to end: concurrent streaming requests against
-//! an alias of equal-latency candidates spread evenly over its boxes.
+//! an alias whose boxes the router cannot tell apart spread evenly over them.
 //!
 //! Why this needs the real dispatcher and not the router's unit tests: the
 //! property lives in the gap between two statements of one routing decision —
@@ -9,6 +9,37 @@
 //! this drives a proxy listener on a multi-threaded runtime over real
 //! connections, which is the situation the queue adjustment is for: an agent
 //! firing a fan-out of parallel calls, not a client with one request in flight.
+//!
+//! # What the alias's state is while a burst is placed, and how that is made
+//! true rather than hoped for
+//!
+//! The assertions below are exact — one request per box, two per box — so they
+//! are only honest if the alias is in a known state when the picks are made.
+//! Two things had to be built to make that a property of the harness rather
+//! than a coin flip, and the file's predecessor had neither:
+//!
+//! * **The boxes are warmed to one identical sample before the burst**
+//!   ([`Boxes::warm`]), so "interchangeable boxes" is a state the test puts
+//!   there and not an assumption about boxes that have never answered.
+//! * **No box sends its first byte until the whole burst has been placed**
+//!   ([`held_box`]'s first-byte gate), and that is what freezes the state.
+//!   `record_success` fires at time-to-first-byte ([`sturnus::server`]), while
+//!   the stream is still being held, so a box that answers at once warms itself
+//!   mid-burst: the first request of the burst rewrites its box's latency EWMA
+//!   and the second pick is made on an alias that is no longer the one the test
+//!   described. That is what the predecessor's "nothing is warmed" precondition
+//!   silently lost, and it is why its split was flaky ~2.5–10% of runs: the
+//!   router's answer was *correct* for the state it saw (one warmed box against
+//!   one cold one is 1000 to 250, i.e. 80% on the warmed box) and the assertion
+//!   was asserting about a different state.
+//!
+//! With the gate held, the alias's latency state cannot change at all while the
+//! burst is being placed — the only thing that moves it is a first byte, and
+//! every first byte is waiting on the test. So the distribution read after the
+//! burst is the distribution the Weyl walk produces over a known state, which
+//! is a deterministic thing to assert on, and the harness has no sleeps in it
+//! as the mechanism: it warms a state, polls until the burst has arrived, and
+//! reads what the router did.
 //!
 //! Every mock box holds its stream open until the test releases it, so a burst
 //! is provably concurrent rather than merely fast: when the distribution is
@@ -32,7 +63,7 @@ use sturnus::metrics::Metrics;
 use sturnus::model_map::ModelMap;
 use sturnus::router::RoundRobinState;
 use sturnus::server::{run_server, AppState, BufferBudget};
-use sturnus::tracker::Tracker;
+use sturnus::tracker::{LatencyMode, Tracker};
 
 use common::CapturedLogs;
 
@@ -42,14 +73,21 @@ mod common;
 /// purpose, so a failure means a real fault rather than a slow machine.
 const SETTLE: Duration = Duration::from_secs(5);
 
+/// The latency every box of a warmed alias is sampled at. The number itself is
+/// arbitrary — what matters is that it is the *same* number on every box, so
+/// the router's only way to tell two of them apart is who is already carrying
+/// a request.
+const WARM: Duration = Duration::from_millis(100);
+
 // ---------------------------------------------------------------------------
 // The alias and its mock boxes
 // ---------------------------------------------------------------------------
 
 /// One alias, `n` candidates, one held-stream mock box per provider (`box0` ..
 /// `boxN-1`). Every box is identical in every way the router can see — same
-/// model name, same latency, nothing warmed — so the only thing that can tell
-/// two of them apart is who is already carrying a request.
+/// model name, same latency, and [`Boxes::warm`] puts the same latency EWMA on
+/// every one of them — so the only thing that can tell two of them apart is who
+/// is already carrying a request.
 fn alias_config(ports: &[u16], alias: &str) -> String {
     let mut toml = String::new();
     for (i, port) in ports.iter().enumerate() {
@@ -113,26 +151,39 @@ fn start_server(state: Arc<AppState>) -> (std::net::SocketAddr, oneshot::Sender<
     (addr, tx)
 }
 
-/// One mock box: takes a request, starts an SSE stream, then holds it open
-/// until the test hands over a permit. The hold is the window in which the
-/// request is provably outstanding, and the test owns it — nothing about a held
-/// stream depends on how fast the router was.
+/// One mock box: takes a request, sends the response head, then waits on two
+/// gates the test owns.
 ///
-/// Returns the port, a counter of requests the box has taken, and the permit
-/// semaphore that finishes its held streams. A permit is spent on one stream
-/// and forgotten, so releasing k permits finishes exactly k streams.
-async fn held_box() -> (u16, Arc<AtomicUsize>, Arc<Semaphore>) {
+/// The **first-byte gate** is the one that makes this file's precondition true.
+/// The proxy records a candidate's latency at the first byte of the body, so a
+/// box that answers immediately warms itself while the burst is still being
+/// placed, and the alias the later picks score is not the alias the test
+/// described. Holding the first byte means no pick in a burst can be made on a
+/// state the test did not put there.
+///
+/// The **finish gate** is the window in which the request is provably
+/// outstanding: the test owns it, and nothing about a held stream depends on
+/// how fast the router was.
+///
+/// Returns the port, a counter of requests the box has taken, and the two
+/// permit semaphores. A permit is spent on one stream and forgotten, so
+/// releasing k permits finishes exactly k streams — which is why the test hands
+/// out exactly as many as it has streams waiting, per box.
+async fn held_box() -> (u16, Arc<AtomicUsize>, Arc<Semaphore>, Arc<Semaphore>) {
     let (listener, port) = common::bind().await;
     let hits = Arc::new(AtomicUsize::new(0));
-    let release = Arc::new(Semaphore::new(0));
+    let first_byte = Arc::new(Semaphore::new(0));
+    let finish = Arc::new(Semaphore::new(0));
     let upstream_hits = Arc::clone(&hits);
-    let upstream_release = Arc::clone(&release);
+    let upstream_first_byte = Arc::clone(&first_byte);
+    let upstream_finish = Arc::clone(&finish);
     tokio::spawn(async move {
         loop {
             let Ok((mut conn, _)) = listener.accept().await else {
                 return;
             };
-            let release = Arc::clone(&upstream_release);
+            let first_byte = Arc::clone(&upstream_first_byte);
+            let finish = Arc::clone(&upstream_finish);
             let hits = Arc::clone(&upstream_hits);
             tokio::spawn(async move {
                 if common::read_request(&mut conn).await.is_err() {
@@ -140,8 +191,14 @@ async fn held_box() -> (u16, Arc<AtomicUsize>, Arc<Semaphore>) {
                 }
                 hits.fetch_add(1, Ordering::Relaxed);
                 sse_head(&mut conn).await;
+                // Nothing has been recorded for this request yet: the proxy is
+                // waiting on the byte the test has not allowed out.
+                let Ok(permit) = first_byte.acquire().await else {
+                    return;
+                };
+                permit.forget();
                 sse_chunk(&mut conn, "data: a\n\n").await;
-                let Ok(permit) = release.acquire().await else {
+                let Ok(permit) = finish.acquire().await else {
                     return;
                 };
                 permit.forget();
@@ -150,7 +207,7 @@ async fn held_box() -> (u16, Arc<AtomicUsize>, Arc<Semaphore>) {
             });
         }
     });
-    (port, hits, release)
+    (port, hits, first_byte, finish)
 }
 
 async fn sse_head(conn: &mut TcpStream) {
@@ -199,7 +256,13 @@ struct Boxes {
     alias: String,
     state: Arc<AppState>,
     addr: std::net::SocketAddr,
+    /// Provider name per box, in creation order (`box0`, `box1`, …). The
+    /// distribution the tests read is in provider-name order, which is not the
+    /// same ordering once an alias has ten boxes, so permits are matched to
+    /// boxes by name rather than by position.
+    providers: Vec<String>,
     hits: Vec<Arc<AtomicUsize>>,
+    first_bytes: Vec<Arc<Semaphore>>,
     releases: Vec<Arc<Semaphore>>,
     /// Held so the server stops when the test's `Boxes` does.
     _server: oneshot::Sender<()>,
@@ -212,24 +275,76 @@ impl Boxes {
     async fn start(count: usize, alias: &str) -> Self {
         let mut ports = Vec::new();
         let mut hits = Vec::new();
+        let mut first_bytes = Vec::new();
         let mut releases = Vec::new();
         for _ in 0..count {
-            let (port, hit, release) = held_box().await;
+            let (port, hit, first_byte, release) = held_box().await;
             ports.push(port);
             hits.push(hit);
+            first_bytes.push(first_byte);
             releases.push(release);
         }
+        let providers = (0..count).map(|i| format!("box{i}")).collect();
         let state = state_for(&alias_config(&ports, alias), caller_client());
         let (addr, _shutdown) = start_server(state.clone());
         Self {
             alias: alias.to_string(),
             state,
             addr,
+            providers,
             hits,
+            first_bytes,
             releases,
             _server: _shutdown,
             burst: Vec::new(),
         }
+    }
+
+    /// The alias's candidates' stats slots, in provider-name order — the order
+    /// every distribution in this file is read in.
+    fn stats_indices(&self) -> Vec<usize> {
+        self.in_provider_order(|candidate| candidate.stats_index)
+    }
+
+    /// Map the alias's candidates, in provider-name order, through `f`.
+    fn in_provider_order<T>(
+        &self,
+        mut f: impl FnMut(&sturnus::model_map::ResolvedCandidate) -> T,
+    ) -> Vec<T> {
+        let mut rows: Vec<(String, T)> = self
+            .state
+            .model_map
+            .iter()
+            .filter(|(alias, _)| *alias == self.alias)
+            .map(|(_, candidate)| (candidate.provider_name.clone(), f(candidate)))
+            .collect();
+        rows.sort_unstable_by_key(|(provider, _)| provider.clone());
+        rows.into_iter().map(|(_, value)| value).collect()
+    }
+
+    /// Warm the given boxes (indices in provider order) to one identical
+    /// latency sample, so the router sees boxes it cannot tell apart on
+    /// latency and the only asymmetry in the alias is the one the burst
+    /// creates.
+    ///
+    /// Recording the sample on the tracker is the honest way to get there: the
+    /// alternative the predecessor relied on was "assume nothing has been
+    /// warmed", which the first request of the burst itself broke. Warming a
+    /// subset is how a leader with a real EWMA lead is built — see
+    /// [`a_warmed_leader_shares_a_burst_with_its_cold_twin`].
+    fn warm(&self, boxes: &[usize]) {
+        let stats = self.stats_indices();
+        for i in boxes {
+            self.state
+                .tracker
+                .record_success(stats[*i], LatencyMode::Streaming, WARM);
+        }
+    }
+
+    /// Warm every box of the alias to the same sample.
+    fn warm_all(&self) {
+        let all: Vec<usize> = (0..self.stats_indices().len()).collect();
+        self.warm(&all);
     }
 
     /// Fire `n` streaming requests at the alias together — `n` separate
@@ -239,35 +354,73 @@ impl Boxes {
     ///
     /// The responses stay unread and unconsumed on purpose: the burst has to
     /// still be outstanding when the distribution is read.
+    ///
+    /// The sends are spawned rather than awaited in place because the
+    /// distribution has to be read *between* "every request has been placed"
+    /// and "every request has been answered": the caller's `send()` resolves at
+    /// the first byte, which no box is allowed to send until
+    /// [`Boxes::open_first_bytes`] hands the alias back to the upstream. So the
+    /// burst is placed on a frozen alias, read, and only then released.
     async fn burst(&mut self, n: usize) -> Vec<usize> {
         // What the boxes had taken before this burst: their counters are
-        // cumulative, and the wait below is on this burst's arrivals only.
-        let arrived_before: usize = self
-            .hits
-            .iter()
-            .map(|hit| hit.load(Ordering::Relaxed))
-            .sum();
+        // cumulative, and the waits below are on this burst's arrivals only.
+        let arrived_before: Vec<usize> = self.arrivals();
 
+        // The address and body are taken out of `self` first: a spawned future
+        // has to be `'static`, so it cannot borrow from the alias it is about to
+        // fire at.
+        let addr = self.addr;
+        let body = streaming_request(&self.alias);
         let client = caller_client();
         let sends: Vec<_> = (0..n)
             .map(|_| {
-                client
-                    .post(format!("http://{}/v1/chat/completions", self.addr))
-                    .json(&streaming_request(&self.alias))
-                    .send()
+                let client = client.clone();
+                let body = body.clone();
+                tokio::spawn(async move {
+                    client
+                        .post(format!("http://{addr}/v1/chat/completions"))
+                        .json(&body)
+                        .send()
+                        .await
+                })
             })
             .collect();
-        let responses = futures_util::future::join_all(sends).await;
-        for resp in responses {
-            let resp = resp.unwrap();
-            assert_eq!(resp.status(), 200, "a held upstream answers 200");
-            self.burst.push(resp);
-        }
 
         // Every request of the burst is now outstanding: counted against the
         // candidate it was dispatched to, and no stream can have finished
         // because nothing has been released.
-        self.wait_for_burst(n, arrived_before).await
+        let queue = self.wait_for_burst(n, &arrived_before).await;
+
+        // …and the alias is exactly the state it was warmed to: a latency
+        // sample is recorded at the first byte, and every box is still holding
+        // its. Open the gates now, and collect the responses.
+        self.open_first_bytes(&arrived_before);
+        for send in sends {
+            let resp = send.await.unwrap().unwrap();
+            assert_eq!(resp.status(), 200, "a held upstream answers 200");
+            self.burst.push(resp);
+        }
+        queue
+    }
+
+    /// Requests each box has taken, in creation order.
+    fn arrivals(&self) -> Vec<usize> {
+        self.hits
+            .iter()
+            .map(|hit| hit.load(Ordering::Relaxed))
+            .collect()
+    }
+
+    /// Let exactly as many first bytes out per box as this burst left waiting
+    /// on that box, so no permit is left over to release a later burst's stream
+    /// early.
+    fn open_first_bytes(&self, arrived_before: &[usize]) {
+        for (i, hit) in self.hits.iter().enumerate() {
+            let arrived = hit.load(Ordering::Relaxed) - arrived_before[i];
+            if arrived > 0 {
+                self.first_bytes[i].add_permits(arrived);
+            }
+        }
     }
 
     /// Poll until the alias has `n` requests outstanding and each of them has
@@ -275,23 +428,20 @@ impl Boxes {
     /// moment it is committed to a candidate, which is before the upstream sees
     /// it, so waiting on the count alone would sample a distribution while part
     /// of the burst was still on the wire to its box.
-    async fn wait_for_burst(&self, n: usize, arrived_before: usize) -> Vec<usize> {
+    async fn wait_for_burst(&self, n: usize, arrived_before: &[usize]) -> Vec<usize> {
+        let before: usize = arrived_before.iter().sum();
         let deadline = tokio::time::Instant::now() + SETTLE;
         loop {
             let queue = self.in_flight_by_box();
-            let arrived: usize = self
-                .hits
-                .iter()
-                .map(|hit| hit.load(Ordering::Relaxed))
-                .sum();
-            if queue.iter().sum::<usize>() == n && arrived == arrived_before + n {
+            let arrived: usize = self.arrivals().iter().sum();
+            if queue.iter().sum::<usize>() == n && arrived == before + n {
                 return queue;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "the burst never settled: {n} requests outstanding expected, the tracker says \
                  {queue:?} and the boxes have taken {} of them",
-                arrived - arrived_before,
+                arrived - before,
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -299,19 +449,18 @@ impl Boxes {
 
     /// The live in-flight count of every candidate, in provider order.
     fn in_flight_by_box(&self) -> Vec<usize> {
-        let mut counts: Vec<(String, usize)> = self
-            .state
-            .model_map
-            .iter()
-            .map(|(_, candidate)| {
-                (
-                    candidate.provider_name.clone(),
-                    self.state.tracker.in_flight(candidate.stats_index),
-                )
-            })
-            .collect();
-        counts.sort_unstable_by_key(|(provider, _)| provider.clone());
-        counts.into_iter().map(|(_, count)| count).collect()
+        self.in_provider_order(|candidate| self.state.tracker.in_flight(candidate.stats_index))
+    }
+
+    /// The same counts, paired with the box they belong to, so a release can be
+    /// matched to the box that is holding the stream.
+    fn in_flight_by_provider(&self) -> Vec<(String, usize)> {
+        self.in_provider_order(|candidate| {
+            (
+                candidate.provider_name.clone(),
+                self.state.tracker.in_flight(candidate.stats_index),
+            )
+        })
     }
 
     /// `GET /status` → `in_flight` per candidate, in provider order. Reading
@@ -344,11 +493,20 @@ impl Boxes {
     /// what lets each relay complete and return its count), and wait for the
     /// alias to be idle again.
     async fn settle(&mut self) {
-        // One permit finishes one held stream, so hand out as many as the burst
-        // had requests; the extras are never acquired.
-        let held = self.burst.len();
-        for release in &self.releases {
-            release.add_permits(held);
+        // One permit finishes one held stream, so each box gets exactly the
+        // number of streams it is holding — its own live count. Handing every
+        // box the size of the whole burst, as this file's predecessor did,
+        // leaves permits sitting on boxes that had nothing to release, and the
+        // next burst on the same alias finds its streams finishing by
+        // themselves: the surplus spends the release before the test asks for
+        // it, and the burst that is supposed to be outstanding is not.
+        let held = self.in_flight_by_provider();
+        for (provider, count) in &held {
+            if let Some(i) = self.providers.iter().position(|p| p == provider) {
+                if *count > 0 {
+                    self.releases[i].add_permits(*count);
+                }
+            }
         }
 
         let burst = std::mem::take(&mut self.burst);
@@ -425,10 +583,21 @@ fn logged_shares(logs: &CapturedLogs, alias: &str) -> Vec<String> {
 
 /// Every pick of a burst reads a snapshot of the alias's load, and under a
 /// reservation taken as the pick is made, a later pick's snapshot has to be
-/// one request heavier than an earlier one's. So for a pair — the idle alias,
-/// then an alias carrying one request — the two logged share sets cannot match,
-/// and a match is the race written down: the second pick scored counts the
-/// first had already spent.
+/// one request heavier than an earlier one's. So for a pair — the alias with
+/// nothing on it, then the alias carrying one request — the two logged share
+/// sets cannot match, and a match is the race written down: the second pick
+/// scored counts the first had already spent.
+///
+/// The premise this rests on is that a reservation *changes* the shares it
+/// reports, and that is only true of a scoring reference that does not move
+/// with the candidate being scored. Both boxes here are warmed to the same
+/// sample, so the second pick's snapshot is 125/1000 against the first's
+/// 1000/1000. Scored against the queue-inflated minimum instead, a reservation
+/// on the alias's best box leaves the shares byte-identical — a warmed leader
+/// against a cold twin reads 80.0%/20.0% at one request in flight and at none —
+/// and this assertion has nothing to check. That is why the pair is warmed:
+/// not to make the split happen, which the Weyl walk does anyway, but to make
+/// the line the assertion reads mean what the assertion says.
 ///
 /// Sound for a pair only, and only because the two snapshots differ: a load
 /// that sits evenly on the alias renders as the same even split whether it is
@@ -460,10 +629,16 @@ fn assert_each_pick_saw_its_own_snapshot(alias: &str, expected: usize) {
 /// The CHANGELOG's headline, end to end: a same-instant pair of streaming
 /// requests against an alias of two interchangeable boxes splits one per box,
 /// instead of both queueing behind whichever box the EWMA happened to like.
+/// "Interchangeable" is the state the test builds — both boxes warmed to the
+/// same sample, no box allowed to answer while the pair is placed — and it is
+/// the state the pair splits one per box *because of*. A pair whose boxes are
+/// not interchangeable, where one has a real lead, is the next test's subject,
+/// and there the router is right to prefer one box.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_same_instant_pair_splits_one_per_box() {
     let mut boxes = Boxes::start(2, "pair").await;
     proxy_logs();
+    boxes.warm_all();
 
     // One request per candidate: with a full alias and an empty one, "at most
     // one per candidate" and "one per candidate" are the same statement, so a
@@ -484,6 +659,21 @@ async fn a_same_instant_pair_splits_one_per_box() {
     assert_each_pick_saw_its_own_snapshot("pair", 2);
 
     boxes.settle().await;
+
+    // A second burst on the same alias, which is what the file is safe to do
+    // now that `settle` releases exactly the streams each box is holding: a
+    // box left with a spare permit finishes this burst's stream on its own,
+    // the request stops being load mid-burst, and the distribution read below
+    // is a fiction.
+    boxes.warm_all();
+    let queue = boxes.burst(2).await;
+    assert_eq!(
+        queue,
+        vec![1; 2],
+        "a second same-instant pair on the same alias must split one per box too; the in-flight \
+         distribution was {queue:?}",
+    );
+    boxes.settle().await;
 }
 
 /// The same property with a burst larger than the alias, which is what an agent
@@ -503,6 +693,7 @@ async fn a_same_instant_pair_splits_one_per_box() {
 async fn a_burst_twice_the_size_of_its_alias_still_splits_evenly() {
     let mut boxes = Boxes::start(4, "eight").await;
     proxy_logs();
+    boxes.warm_all();
 
     let queue = boxes.burst(8).await;
     assert_eq!(
@@ -517,6 +708,44 @@ async fn a_burst_twice_the_size_of_its_alias_still_splits_evenly() {
         boxes.in_flight_from_status().await,
         vec![2; 4],
         "/status must show the even queue distribution the router just routed on"
+    );
+
+    boxes.settle().await;
+}
+
+/// The case the scoring reference is for, end to end: one box with a real
+/// latency lead (100ms, warmed) and one with no latency data at all, four
+/// concurrent requests. The leader is the alias's best box, so it is also the
+/// minimum the weights are taken against — and that is exactly why scoring
+/// against the *queue-adjusted* minimum made its queue invisible: at one
+/// request in flight its adjusted latency is the alias's best, so its weight
+/// stayed the full 1000 units, twice the cold box's 250-unit probe, and the
+/// burst piled onto it. Measured at `9484fd8` this alias lands `[3, 1]`, in
+/// every run; the same alias over the fixed reference lands `[2, 2]`.
+///
+/// Normalised against the load-free 100ms, one request costs the leader 8x of
+/// its weight (125 units) and the cold twin's probe outranks it, so the four
+/// requests go two per box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_warmed_leader_shares_a_burst_with_its_cold_twin() {
+    let mut boxes = Boxes::start(2, "leader").await;
+    proxy_logs();
+    // Only the leader is warmed: the cold twin is the situation a real alias is
+    // in the moment it starts taking traffic, and the one where a leader's
+    // queue was invisible.
+    boxes.warm(&[0]);
+
+    let queue = boxes.burst(4).await;
+    assert_eq!(
+        queue,
+        vec![2; 2],
+        "a warmed leader carrying a request must lose weight to its cold twin, not take the \
+         whole burst; the in-flight distribution was {queue:?}",
+    );
+    assert_eq!(
+        boxes.in_flight_from_status().await,
+        vec![2; 2],
+        "/status must show the leader sharing the burst with the box it was probed against"
     );
 
     boxes.settle().await;

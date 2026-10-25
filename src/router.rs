@@ -35,25 +35,31 @@ impl RoundRobinState {
 }
 
 /// Default exploit sharpness (the `routing.exploit_k` default): traffic to
-/// each candidate is proportional to `(best_effective / its_effective)^k`,
-/// where effective latency folds the error rate and the outstanding load in.
-/// Higher = stronger preference for the best. Scale-invariant (depends on the
-/// ratio, not absolute ms), so a fixed default generalises: a 2x-worse
-/// candidate gets ~1/8 the traffic, a 5x-worse one ~1/125.
+/// each candidate is proportional to `(best_reference / its_effective)^k`,
+/// where `best_reference` is the best *load-free* effective latency in the
+/// alias and `its_effective` folds the error rate and the outstanding load of
+/// the candidate into its own. Higher = stronger preference for the best.
+/// Scale-invariant (depends on the ratio, not absolute ms), so a fixed default
+/// generalises: a 2x-worse candidate gets ~1/8 the traffic, a 5x-worse one
+/// ~1/125, and one outstanding request costs a candidate the same 1/8.
 pub const EXPLOIT_K: f64 = 3.0;
 
-/// Fastest candidate gets this many weight units; everyone else's weight is
-/// scaled relative to it (but never below the `PROBE_FLOOR` share).
+/// The load-free reference candidate gets this many weight units; everyone
+/// else's weight is scaled relative to it (but never below the `PROBE_FLOOR`
+/// share). The reference is the best effective latency with the queue term
+/// excluded, so a candidate carrying a queue is scaled against what it was
+/// worth when idle, not against what its own queue made it.
 const WEIGHT_RESOLUTION: f64 = 1000.0;
 
-/// Cold candidates probe at this fraction of the fastest candidate's rate.
+/// Cold candidates probe at this fraction of the reference candidate's rate.
 const COLD_PROBE_WEIGHT: f64 = 0.25;
 
-/// Minimum weight for any candidate, as a fraction of `WEIGHT_RESOLUTION`.
-/// This is the probe rate for a hard-failing candidate, and it bounds both
-/// sides of the same trade: at most ~this share of alias traffic eats
-/// user-facing errors during an outage (there is no failover retry), and a
-/// recovered candidate is re-detected within ~`1/PROBE_FLOOR` requests.
+/// Minimum weight for any candidate, as a fraction of `WEIGHT_RESOLUTION`,
+/// i.e. of the load-free reference. This is the probe rate for a hard-failing
+/// candidate, and it bounds both sides of the same trade: at most ~this share
+/// of alias traffic eats user-facing errors during an outage (there is no
+/// failover retry), and a recovered candidate is re-detected within
+/// ~`1/PROBE_FLOOR` requests.
 const PROBE_FLOOR: f64 = 0.01;
 
 /// Success-rate floor inside effective latency: a fully failing candidate
@@ -139,9 +145,10 @@ impl std::fmt::Display for WeightedSchedule<'_> {
 /// EWMA, i.e. expected time per successful response, adjusted for the load
 /// already outstanding against each candidate (see the queue comment in the
 /// body). Each candidate gets traffic proportional to
-/// `(best_effective / its_effective)^k`, so slower or erroring candidates
-/// keep a small but never-zero share. That share doubles as the probe
-/// through which a recovered candidate wins traffic back.
+/// `(best_reference / its_effective)^k`, where `best_reference` is the best
+/// *load-free* effective latency in the alias, so slower, busier or erroring
+/// candidates keep a small but never-zero share. That share doubles as the
+/// probe through which a recovered candidate wins traffic back.
 ///
 /// Pure: reads the tracker but does not advance the round-robin counter and
 /// does not reserve anything, so it can be called for observability without
@@ -159,8 +166,9 @@ pub fn weighted_schedule<'a>(
     k: f64,
     mode: LatencyMode,
 ) -> WeightedSchedule<'a> {
-    // Effective latency (ms per successful response), then the queue
-    // adjustment; None = cold for `mode`.
+    // Measured effective latency (ms per successful response), with the load
+    // that candidate is carrying alongside it; None = cold for `mode`. The
+    // queue adjustment is applied below, against the reference computed there.
     //
     // Why multiply by (1 + in_flight): the score a request should be routed
     // on is the wait IT can expect, not the latency this box happened to
@@ -179,8 +187,73 @@ pub fn weighted_schedule<'a>(
     // batch and catastrophe on a 20ms one — while a multiplicative factor
     // composes with the ratio-of-latencies weighting the share table already
     // rests on.
+    let loads: Vec<(Option<f64>, usize)> = candidates
+        .iter()
+        .map(|c| {
+            let stats = tracker.stats(c.stats_index);
+            if stats.is_cold(mode) {
+                (None, stats.in_flight())
+            } else {
+                // Guarded against a 0ms EWMA.
+                #[allow(clippy::cast_precision_loss)]
+                let measured =
+                    stats.ewma_ms(mode).max(1) as f64 / stats.success_rate().max(MIN_SUCCESS_RATE);
+                (Some(measured), stats.in_flight())
+            }
+        })
+        .collect();
+
+    // The reference every weight is normalised against: the best *load-free*
+    // effective latency in the alias, `min(ewma / success_rate)` over the warm
+    // candidates, with the queue term deliberately left out. Infinite while
+    // everyone is cold.
     //
-    // Three properties this buys:
+    // Leaving it out is the whole point of the scoring, and the reason it used
+    // to be wrong. A weight is a ratio, and a ratio says something about the
+    // candidate it is taken on only if its numerator is a fixed yardstick. Take
+    // the minimum over the *queue-adjusted* latencies and the leader's own
+    // `(1 + n)` sits in the numerator and the denominator of its own weight at
+    // once, where it cancels exactly: the one candidate the queue term exists
+    // to penalise is the one candidate it cannot touch, and it holds a full
+    // 1000 units for as long as it stays the fastest box. Measured at this
+    // ticket's parent: a warmed 100ms leader carrying one request scored
+    // effective 200ms, became the reference itself, kept weight 1000 against a
+    // cold twin's 250 — 80% of the alias — and a burst piled onto it: eight
+    // picks over that alias and its three cold twins came out `[6, 1, 0, 1]`,
+    // every run, at `9484fd8`
+    // (`router::tests::a_warmed_leader_spreads_a_burst_over_its_cold_twins`).
+    // "A candidate's score drops as soon as a request is routed to it" held for
+    // every candidate except the winner.
+    //
+    // Against a load-free reference the queue term is an absolute price: one
+    // outstanding request costs `(1 + n)^k` of the reference weight, so that
+    // same leader at n = 1 and the default sharpness is at 1000/8 = 125 units
+    // and a cold twin's 250-unit probe outranks it. Two consequences worth
+    // stating plainly:
+    // * At in_flight 0 the factor is exactly 1.0, so the best candidate's
+    //   adjusted latency *is* the reference: its weight is 1000 and every other
+    //   ratio is the old one. The identity is exact rather than approximate,
+    //   and every pre-existing number — the share table, the golden pick
+    //   traces, `/status` for an idle alias — is bit for bit what it was.
+    // * The two constants denominated in reference units, `PROBE_FLOOR`
+    //   (10 units) and `COLD_PROBE_WEIGHT` (250 units), keep meaning what they
+    //   say once the alias is busy: 1% of the best candidate's weight and a
+    //   quarter of its rate. Normalised against a queue-inflated minimum they
+    //   silently meant "1% of whatever the leader's queue-pinned 1000 is worth
+    //   this instant", which is how a cold box ended up with a fifth of the
+    //   traffic of a leader that was carrying the whole burst.
+    //
+    // What this does not change, because it cannot: shares *between warm
+    // candidates* are invariant under the choice of reference — scaling every
+    // weight by the same constant leaves every share alone. A leader with a
+    // real latency lead over a warmed twin therefore keeps the majority of the
+    // alias at n = 1 (125 to 16 against a 4x-slower twin, 88.7%), and rightly
+    // so: `(1 + 1)·L` is still the shorter wait. The reference is what makes a
+    // loaded leader legible against the fixed constants, which is where the
+    // pile-up was measured; the ratio is what keeps a genuinely slower box
+    // avoided rather than load-balanced to.
+    //
+    // Three properties the adjustment buys:
     // * A burst spreads. N equal idle candidates weigh equal; the first pick
     //   doubles its target's effective latency, dropping its weight by 2^k
     //   (8x at k=3) against every still-idle candidate, so the next pick
@@ -205,35 +278,20 @@ pub fn weighted_schedule<'a>(
     //   queue empties. Nothing integrates, nothing overshoots: at in_flight
     //   0 the schedule is exactly the latency-only schedule, which is the
     //   fixed point any idle alias sits at.
-    let effective: Vec<Option<f64>> = candidates
+    let best_reference = loads
         .iter()
-        .map(|c| {
-            let stats = tracker.stats(c.stats_index);
-            if stats.is_cold(mode) {
-                None
-            } else {
-                // Guarded against a 0ms EWMA.
-                #[allow(clippy::cast_precision_loss)]
-                let measured =
-                    stats.ewma_ms(mode).max(1) as f64 / stats.success_rate().max(MIN_SUCCESS_RATE);
-                Some(measured * queue_factor(stats.in_flight()))
-            }
-        })
-        .collect();
-
-    // Reference = best effective latency; infinite while everyone is cold.
-    let best = effective
-        .iter()
-        .flatten()
-        .copied()
+        .filter_map(|(measured, _)| *measured)
         .fold(f64::INFINITY, f64::min);
 
     // Floor at the probe share so no candidate starves.
     let mut entries: Vec<ScheduledCandidate<'a>> = Vec::with_capacity(candidates.len());
     let mut total_weight: usize = 0;
-    for (candidate, effective_latency) in candidates.iter().zip(&effective) {
+    for (candidate, (measured, in_flight)) in candidates.iter().zip(&loads) {
+        // The wait a request routed here can expect: the measured effective
+        // latency inflated by the queue already in front of it.
+        let effective_latency = measured.map(|latency| latency * queue_factor(*in_flight));
         let raw_weight = match effective_latency {
-            Some(latency) => (best / latency).powf(k),
+            Some(latency) => (best_reference / latency).powf(k),
             // Cold: fixed probe share (full when everyone is cold), scaled
             // by success rate so erroring cold candidates back off too, and
             // by the same queue factor the warm path got — a cold candidate
@@ -241,6 +299,14 @@ pub fn weighted_schedule<'a>(
             // (Dividing the weight by (1+n)^k is the latency-domain factor
             // (L·(1+n)) carried into the weight domain, where a cold
             // candidate has no L of its own to inflate.)
+            //
+            // The share is denominated in the same load-free reference as the
+            // warm path — 250 units of the 1000-unit best-reference weight —
+            // which is what makes it a probe *share* rather than a ranking,
+            // and what keeps it a quarter of the best candidate's rate when
+            // the best candidate is busy. A cold candidate's own queue does
+            // enter, through the divisor below; only its latency is unknown,
+            // and an unknown latency is why it gets a probe and not a score.
             //
             // The floor clips that factor short: at the default sharpness a
             // cold 25% probe is 250 units idle, 31 with one request out, and
@@ -252,7 +318,7 @@ pub fn weighted_schedule<'a>(
             None => {
                 let stats = tracker.stats(candidate.stats_index);
                 let rate = stats.success_rate();
-                let base = if best.is_finite() {
+                let base = if best_reference.is_finite() {
                     COLD_PROBE_WEIGHT
                 } else {
                     1.0
@@ -268,7 +334,7 @@ pub fn weighted_schedule<'a>(
             candidate,
             weight,
             share: 0.0,
-            effective_latency_ms: *effective_latency,
+            effective_latency_ms: effective_latency,
         });
         total_weight += weight;
     }
