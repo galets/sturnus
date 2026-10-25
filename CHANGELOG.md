@@ -88,6 +88,30 @@ their history lives in the git log and tags.
 
 ### Fixed
 
+- **A Linux binary built from source no longer depends on the C library of the
+  machine that built it.** `cargo build --release` — the command the README
+  presented as *the* release build, labelled "static binary with LTO" — links
+  against the build host's glibc and stamps that host's symbol versions into
+  the binary. Installed on an older host it complains on every start, before
+  the process has done anything:
+  `weak version 'GLIBC_2.39' not found (required by /usr/local/bin/sturnus)`.
+  Nothing in sturnus can explain or suppress that line, because the dynamic
+  loader emits it before `main`. The documented Linux release build is now the
+  static musl target — the target the container images and the published
+  release assets were already built from, so downloading a release asset
+  changes nothing. `scripts/build-static.sh` builds x86_64 and aarch64 with the
+  toolchain prerequisites stated up front, and `scripts/check-static.sh` fails
+  any binary that declares `libc.so.6`, `libm.so.6`, or `libgcc_s.so.1`, or
+  names a program interpreter. The release pipeline now runs that check on its
+  own Linux artifacts as it publishes them, and fails if an expected
+  architecture's binary is absent, so a mistyped artifact pattern can no longer
+  drop a platform quietly. The README separates the two builds it previously
+  conflated — a host build, for developing and testing on the machine you are
+  on, and the static target for a binary you intend to install on another
+  Linux — and says what `cargo install` really produces: a binary bound to the
+  host that compiled it, with the static target named as the way to opt out.
+  `cargo build --release`, `cargo test`, and `cargo install` keep their current
+  behaviour, in CI and for everyone who never intends to ship a binary.
 - **Benign caller disconnects no longer log at ERROR.** A caller that hangs up
   mid-request now appears at `debug` with its address and in the new
   `sturnus_client_disconnects_total` counter instead of filling the journal

@@ -13,6 +13,8 @@ cargo fmt --check
 
 CI runs `fmt --check`, `clippy -D warnings`, `cargo test`, and a release build on every pull request, so please run all four locally before opening one. The codebase forbids `unsafe`, denies leftover `todo!`/`dbg!`/`unimplemented!`, and warns on `unwrap`/`expect` outside tests — keep new code in that spirit.
 
+Those commands all build for the machine you are on, which is what a development workflow wants. A binary meant to be installed on *another* Linux is a different build, with a different target and a check that it carries no C library dependency — see [Building](README.md#building) and `scripts/build-static.sh`.
+
 ## Pull requests
 
 - Keep PRs focused; one logical change per PR.

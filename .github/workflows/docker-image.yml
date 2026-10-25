@@ -32,6 +32,9 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --target ${{ matrix.target }}
       - run: cp target/${{ matrix.target }}/release/sturnus sturnus-${{ matrix.target }}
+      # This binary is published as a release asset and copied onto hosts with
+      # any glibc, so prove here that it asks their loader for nothing.
+      - run: scripts/check-static.sh sturnus-${{ matrix.target }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binary-${{ matrix.target }}

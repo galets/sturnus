@@ -20,6 +20,17 @@ docker run -v ./config.toml:/config.toml \
   ghcr.io/sturnus-dev/sturnus:latest
 ```
 
+**Download** — best for installing on a host. Grab the asset for your architecture from the latest [release](https://github.com/sturnus-dev/sturnus/releases/latest):
+
+```bash
+curl -fL -o sturnus \
+  https://github.com/sturnus-dev/sturnus/releases/latest/download/sturnus-x86_64-unknown-linux-musl
+chmod +x sturnus
+./sturnus --help
+```
+
+The Linux assets (`sturnus-x86_64-unknown-linux-musl`, `sturnus-aarch64-unknown-linux-musl`) are static: they declare no C library dependency, so they run on any glibc Linux regardless of which Linux built them. macOS assets are `sturnus-x86_64-apple-darwin` and `sturnus-aarch64-apple-darwin`.
+
 **`cargo install`** — best for local testing if you have a Rust toolchain:
 
 ```bash
@@ -27,7 +38,7 @@ cargo install sturnus
 sturnus --config config.toml
 ```
 
-Prebuilt static binaries for Linux and macOS (x86_64 and aarch64) are attached to every [release](https://github.com/sturnus-dev/sturnus/releases/latest).
+`cargo install` compiles on your machine against your machine's C library, so the binary it leaves in `~/.cargo/bin` is bound to that host's glibc and its neighbours. That is fine where you built it. To produce a binary you can copy onto another Linux, build the static target — see [Building](#building).
 
 Then point any OpenAI-compatible SDK at sturnus — the only change is the base URL:
 
@@ -385,16 +396,51 @@ docker run -v ./config.toml:/config.toml \
 
 ## Building
 
+### Host build — for developing on the machine you are on
+
 ```bash
-# Development
-cargo build
-
-# Release (static binary with LTO)
-cargo build --release
-
-# Run tests
+cargo build            # debug
+cargo build --release  # release, with LTO
 cargo test
 ```
+
+This builds for the machine you are on and links against *its* C library, stamping that library's symbol versions into the binary. It runs on that glibc and newer — which is exactly what you want for developing and testing locally, and what you do not want to install on a machine you cannot rebuild on. Copied to an older host, the dynamic loader complains on every start, before the process has done anything, and no log line, config option, or preflight check can explain it, because none of the program has run yet:
+
+```
+/usr/local/bin/sturnus: /lib/x86_64-linux-gnu/libc.so.6: weak version `GLIBC_2.39' not found (required by /usr/local/bin/sturnus)
+```
+
+### Release build — for installing on another Linux
+
+Build the static musl target, which carries no C library dependency at all:
+
+```bash
+sudo apt-get install musl-tools                 # Debian/Ubuntu; provides musl-gcc
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+
+scripts/check-static.sh target/x86_64-unknown-linux-musl/release/sturnus
+```
+
+`scripts/check-static.sh` is the proof, not a formality: it fails if the binary declares `libc.so.6`, `libm.so.6`, or `libgcc_s.so.1`, or names a program interpreter. The release pipeline runs it on the Linux assets before publishing them.
+
+Both architectures in one command, prerequisites checked and each result verified:
+
+```bash
+scripts/build-static.sh all                     # x86_64 and aarch64
+```
+
+Building `aarch64` on an `x86_64` host needs a cross C compiler for ring's C code: `sudo apt-get install gcc-aarch64-linux-gnu`, or a musl cross toolchain providing `aarch64-linux-musl-gcc`. Building each architecture on its own architecture needs only `musl-tools`.
+
+The published release assets and both container images are built from these targets, and the image runs from `scratch` — no C library on the filesystem at all.
+
+### Run tests
+
+```bash
+cargo test
+```
+
+Tests run against the host build; nothing here changes what `cargo test`, `cargo install`, or a plain `cargo build --release` does.
 
 ## License
 

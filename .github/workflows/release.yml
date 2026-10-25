@@ -47,8 +47,37 @@ jobs:
         type=semver,pattern={{major}}.{{minor}}
         type=raw,value=latest
 
+  # The Linux assets are what people install onto machines that are not this
+  # runner, and a binary that binds to the runner's glibc fails on the first
+  # start there, before any of our code runs. So the release proves the
+  # artifacts are free of that dependency — and that every supported
+  # architecture is present at all, since a mistyped artifact pattern would
+  # otherwise drop a platform from the release quietly.
+  verify-linux:
+    needs: [image, test]
+    runs-on: ubuntu-latest
+    env:
+      arches: x86_64 aarch64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: binary-*-unknown-linux-musl
+          path: dist
+          merge-multiple: true
+      - name: Every supported architecture published a Linux binary
+        run: |
+          for arch in $arches; do
+            if [ ! -f "dist/sturnus-${arch}-unknown-linux-musl" ]; then
+              echo "::error::missing Linux release artifact: sturnus-${arch}-unknown-linux-musl"
+              exit 1
+            fi
+          done
+      - name: Linux binaries carry no C library dependency
+        run: scripts/check-static.sh dist/sturnus-*-unknown-linux-musl
+
   release:
-    needs: [image, build-macos, test]
+    needs: [image, build-macos, test, verify-linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
