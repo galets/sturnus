@@ -30,11 +30,11 @@ sturnus is intentionally a lean, single-binary routing layer, not an LLMOps plat
 - Bug fixes and reliability improvements
 - New providers that fit the existing OpenAI-compatible proxy model
 - Test coverage, documentation, and performance work
-- Routing-signal improvements (latency/error tracking)
+- Routing-signal improvements (the latency and error tracking `/status` reports)
 
 **Probably out of scope** (open an issue to discuss before building):
 - Request-level retries or failover — by design, sturnus is a transparent proxy and leaves retries to client SDKs (see "Design choices" in the README)
-- Cost or quality-based routing — routing optimizes latency within an alias you've declared interchangeable
+- Cost or quality-based routing — routing divides an alias by the `weight` each candidate declares there; the operator states the preference and the router does not infer it
 - Spend tracking, prompt management, a web UI, or a control plane
 - Anything that requires a database, Redis, or shared state
 

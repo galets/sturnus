@@ -4,9 +4,9 @@
 [![GitHub Release](https://img.shields.io/github/v/release/sturnus-dev/sturnus)](https://github.com/sturnus-dev/sturnus/releases)
 [![Docker Image](https://img.shields.io/badge/docker-ghcr.io%2Fsturnus--dev%2Fsturnus-blue?logo=docker)](https://ghcr.io/sturnus-dev/sturnus)
 
-**Automatic latency-based routing across LLM providers. A single static binary, zero infrastructure.**
+**Spread one model alias across LLM providers, in the proportions you declare. A single static binary, zero infrastructure.**
 
-LLM providers have variable latency and availability that can break production features. sturnus is a lightweight sidecar that sits beside your app, exposes an OpenAI-compatible API, and automatically shifts traffic to whichever provider is fastest and available right now.
+LLM providers have variable latency and availability that can break production features. sturnus is a lightweight sidecar that sits beside your app, exposes an OpenAI-compatible API, and divides each alias's traffic across its providers by the weights you declare: 19:1 on the fast box is written `weight = 19` beside `weight = 1`, not discovered by probing.
 
 ## Quick start
 
@@ -51,14 +51,14 @@ Then point any OpenAI-compatible SDK at sturnus — the only change is the base 
 from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:4000/v1", api_key="unused")
 response = client.chat.completions.create(
-    model="fast",  # resolved by sturnus to the fastest available candidate
+    model="fast",  # an alias: sturnus picks one of its candidates by weight
     messages=[{"role": "user", "content": "Hello"}],
 )
 ```
 
 ## Features
 
-- **Latency- and error-aware routing** — the fastest healthy provider gets the bulk of traffic, while slower or erroring ones keep a small, shrinking share. That share doubles as a probe, so a recovered provider wins its traffic back automatically, with no thresholds to trip.
+- **Declared-weight routing** — every candidate of an alias declares an integer `weight` (default 1) and gets `weight / sum(weights)` of that alias's traffic. The split is the arithmetic the config states, drawn deterministically, and nothing measured — latency, error rate, queue depth — scales it. Latency and success-rate EWMAs are still recorded and shown on `/status`, labelled as not used for routing.
 - **Session affinity** — a stateless `x-session-affinity` header pins follow-up requests to the same provider across pods.
 - **Transparent passthrough** — only the `model` field is rewritten: the request body is otherwise forwarded byte-for-byte, preserving key order, number precision, and formatting. Responses, including SSE `text/event-stream` chunks, are relayed untouched as they arrive.
 - **Memory-bounded** — request buffers are capped per request and in aggregate; bursts beyond the memory budget shed load with `429` + `Retry-After` instead of OOMing the pod.
@@ -68,7 +68,7 @@ response = client.chat.completions.create(
 
 ## Why sturnus
 
-Most LLM gateways are either a hosted SaaS you route all your traffic (and keys) through, or a large application with a significant surface area. sturnus is the opposite — **a single static binary** with a small auditable surface area, MIT-licensed and running entirely inside your infrastructure. It speaks the OpenAI API, so any OpenAI-compatible SDK works by changing one base URL. The core capability of sturnus is automatic latency-based routing across providers — something that most gateways put behind an enterprise tier. Each sidecar routes independently from what it observes locally, so there is no shared state to run.
+Most LLM gateways are either a hosted SaaS you route all your traffic (and keys) through, or a large application with a significant surface area. sturnus is the opposite — **a single static binary** with a small auditable surface area, MIT-licensed and running entirely inside your infrastructure. It speaks the OpenAI API, so any OpenAI-compatible SDK works by changing one base URL. The core capability of sturnus is routing one model across several providers by declared weights — something that most gateways put behind an enterprise tier. Each sidecar routes independently from what it observes locally, so there is no shared state to run.
 
 If you need a full LLMOps platform (spend tracking, prompt management, a UI, dozens of integrations), sturnus is not that.
 
@@ -77,8 +77,8 @@ If you need a full LLMOps platform (spend tracking, prompt management, a UI, doz
 
 sturnus has a bounded scope by design and has some deliberate omissions:
 
-- **No request-level failover or retries.** sturnus is a transparent proxy: it surfaces upstream errors to the client verbatim rather than silently retrying within a black box. Error responses still feed the routing signal, so a flaky provider is quickly deprioritized for subsequent traffic — but the individual failed request is returned as-is. Client SDKs (OpenAI, Anthropic, LangChain, etc.) already ship mature, configurable retry and backoff; configure it there and let sturnus steer those retries toward the healthiest provider.
-- **Latency-based, not cost or quality-based.** Routing optimizes time-to-first-chunk *within an alias*, and every model routed under that alias should be largely interchangeable. sturnus never trades quality or cost for speed — it just picks the fastest among options you've already deemed equivalent.
+- **No request-level failover or retries.** sturnus is a transparent proxy: it surfaces upstream errors to the client verbatim rather than silently retrying within a black box. An error is recorded against the provider that produced it and shows up on `/status`, but it does not move traffic — the individual failed request is returned as-is. Client SDKs (OpenAI, Anthropic, LangChain, etc.) already ship mature, configurable retry and backoff; configure it there and let the caller decide what a failure is worth retrying.
+- **Declared weights, not cost or quality-based.** Routing divides an alias by the weights you declare, and every model routed under that alias should be largely interchangeable. sturnus never trades quality or cost for speed, and it never measures its way to a preference you could have written down: a box is fast because the operator says it is fast.
 
 </details>
 
@@ -113,19 +113,22 @@ api_key = "${OPENAI_API_KEY}"
 vertex_ai = { project_id = "my-gcp-project", location = "us-central1" }
 
 # Model map: aliases the client uses → provider+model candidates
+# Each candidate declares an integer `weight` (default 1); its share of the
+# alias is its weight over the sum of the alias's weights.
 [model]
 fast = [
-  { provider = "openai", model = "gpt-4o-mini" },
+  { provider = "openai", model = "gpt-4o-mini", weight = 3 },
   { provider = "vertex", model = "google/gemini-2.5-flash" },
 ]
 
 [routing]
-ewma_alpha = 0.3          # smoothing for the latency and success-rate EWMAs (higher = more reactive)
-exploit_k = 3.0            # exploit sharpness: how strongly the best candidate is preferred (0.0 = even split; see How routing works)
-error_threshold = 0.5      # error-rate EWMA above which a session-affinity pin is broken (routing weights are unaffected)
+ewma_alpha = 0.3          # smoothing for the latency and success-rate EWMAs, which /status reports and routing ignores
+error_threshold = 0.5      # error-rate EWMA above which a session-affinity pin is broken
 ```
 
 See [`config.example.toml`](config.example.toml) for all providers (Groq, Azure, Google AI Studio, Anthropic, local OpenAI-compatible) and options.
+
+A config that still sets `routing.exploit_k` — the sharpness of the measured allocator this design replaced — fails at startup naming `weight` as its replacement, rather than loading and tuning nothing.
 
 Environment variables in `${VAR}` syntax are interpolated at config load time. Where they're available in an `.env` file (`KEY=VALUE` per line), pass it with `--env-file`:
 
@@ -192,7 +195,7 @@ Sidecar keys take precedence over any client-supplied `labels` keys with the sam
 | POST | `/v1/chat/completions` | Proxied to upstream (model alias resolved) |
 | POST | `/v1/embeddings` | Proxied to upstream (model alias resolved) |
 | GET | `/health` | Returns `{"status":"ok"}` |
-| GET | `/status` | Per candidate: cold/warm/degraded state, latency EWMAs, error rate, and the weight and traffic share the router would assign right now |
+| GET | `/status` | Per candidate: cold/warm/degraded state, the declared weight and the traffic share it buys, the live in-flight count, and the latency EWMAs and error rate that are measured but not routed on |
 | GET | `/metrics` | Prometheus metrics (see below) |
 
 The `POST` proxy routes are served only on `listen`. The `GET` observability routes are served on `listen` and, when configured, on `metrics_listen`. When `api_keys` is configured, the `POST` routes additionally require `Authorization: Bearer <key>`; the observability routes never do.
@@ -217,63 +220,63 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
 
 ### Status
 
-`GET /status` answers "why is this box getting nothing?" in one curl, rather than as an inference from a log excerpt. Each candidate of each alias is listed with its health, what it has been measured doing, and what those numbers buy it in the router's schedule right now:
+`GET /status` answers "why is this box getting this share?" in one curl, rather than as an inference from a log excerpt. Each candidate of each alias is listed with its health, what the config declares for it, and what it has been measured doing:
 
 ```json
 {
   "candidates": [
     {
       "alias": "fast",
-      "error_rate": 0.0,
       "in_flight": 2,
       "model": "llama-3.3-70b",
-      "nonstreaming_ewma_ms": 134,
-      "provider": "groq",
-      "routing": {
-        "nonstreaming": { "effective_latency_ms": 134.0, "share": 0.7581501137225171, "weight": 1000 },
-        "streaming":    { "effective_latency_ms": 131.0, "share": 0.774593338497289,  "weight": 1000 }
+      "observed": {
+        "error_rate": 0.0,
+        "nonstreaming_ewma_ms": 134,
+        "note": "measured, not used for routing: allocation is by declared weight",
+        "streaming_ewma_ms": 131
       },
-      "status": "warm",
-      "streaming_ewma_ms": 131
+      "provider": "groq",
+      "routing": { "share": 0.6, "weight": 3 },
+      "status": "warm"
     },
     {
       "alias": "fast",
-      "error_rate": 0.0,
       "in_flight": 0,
       "model": "gpt-4o-mini",
-      "nonstreaming_ewma_ms": 201,
-      "provider": "openai",
-      "routing": {
-        "nonstreaming": { "effective_latency_ms": 201.0, "share": 0.22441243366186506, "weight": 296 },
-        "streaming":    { "effective_latency_ms": 200.0, "share": 0.21766072811773818, "weight": 281 }
+      "observed": {
+        "error_rate": 0.0,
+        "nonstreaming_ewma_ms": 201,
+        "note": "measured, not used for routing: allocation is by declared weight",
+        "streaming_ewma_ms": 200
       },
-      "status": "warm",
-      "streaming_ewma_ms": 200
+      "provider": "openai",
+      "routing": { "share": 0.2, "weight": 1 },
+      "status": "warm"
     },
     {
       "alias": "fast",
-      "error_rate": 0.7599,
       "in_flight": 0,
       "model": "qwen3-32b",
-      "nonstreaming_ewma_ms": 113,
-      "provider": "local",
-      "routing": {
-        "nonstreaming": { "effective_latency_ms": 470.63723448563115, "share": 0.017437452615617893, "weight": 23 },
-        "streaming":    { "effective_latency_ms": null, "share": 0.0077459333849728895, "weight": 10 }
+      "observed": {
+        "error_rate": 0.7599,
+        "nonstreaming_ewma_ms": 113,
+        "note": "measured, not used for routing: allocation is by declared weight",
+        "streaming_ewma_ms": null
       },
-      "status": "degraded",
-      "streaming_ewma_ms": null
+      "provider": "local",
+      "routing": { "share": 0.2, "weight": 1 },
+      "status": "degraded"
     }
   ]
 }
 ```
 
 - **`status`** — `cold` (no latency sample in either mode yet), `warm`, or `degraded` (its error-rate EWMA has passed `error_threshold`, which is also what breaks session-affinity pins to it).
-- **`in_flight`** — requests this candidate has outstanding right now, counted from the moment it is chosen (by the router or by an `x-session-affinity` pin) until its response ends, errors, or is dropped mid-flight, so the wait it covers includes connecting, uploading, TTFB and the stream itself. It is one count per box, so a candidate listed under several aliases shows the same number in every entry, and `0` means nothing is in flight. Read it against `share`: several requests queued on a candidate whose share says it should be getting a third of the alias is the congestion latency-only routing notices far too late.
-- **`routing.<mode>`** — the numbers a request of that mode is routed on, since streaming TTFC and non-streaming response time keep separate EWMAs. `weight` is `(best_effective / its_effective)^exploit_k` scaled so the best candidate in the alias gets 1000, `share` is that weight over the alias's total weight, and `effective_latency_ms` is the latency EWMA over the success-rate EWMA: the number the weight came from, so an erroring candidate's is larger than its latency EWMA (`null` while cold).
-- **A `share` near 0.01 is the probe floor, not starvation.** Every weight is floored at 1% of the best candidate's (`PROBE_FLOOR`), which is what keeps a broken box sampled and lets it win traffic back. A `share` of exactly 0 never happens; `local` above is at the floor in `streaming` (no successes there) and near it in `nonstreaming`.
+- **`in_flight`** — requests this candidate has outstanding right now, counted from the moment it is chosen (by the router or by an `x-session-affinity` pin) until its response ends, errors, or is dropped mid-flight, so the wait it covers includes connecting, uploading, TTFB and the stream itself. It is one count per box, so a candidate listed under several aliases shows the same number in every entry, and `0` means nothing is in flight. Read it against `share`: several requests queued on a candidate whose share says it should be getting a fifth of the alias is congestion the router does not act on — busyness is not an input to placement yet, so the queue is visible, not routed around.
+- **`routing`** — the whole allocation policy, as declared: `weight` is the integer the config gave this candidate in this alias, and `share` is that weight over the alias's total weight. Nothing measured scales it. The `local` row above is the point of the design: it is `degraded` with a 76% error-rate EWMA, and its share is exactly what its weight declares, because a share is not something the router discovers.
+- **`observed`** — what the box has been measured doing: the streaming TTFC and non-streaming response-time EWMAs (`null` while cold in that mode) and the error-rate EWMA, under a `note` saying they are not used for routing. Seeing a box that has quietly gotten slow is, in this design, a human reading a number and changing a `weight`.
 - **Weights are per alias.** A candidate reachable through several aliases appears once per alias, because its share is relative to whoever it competes with there.
-- The numbers come from the same weighted schedule the picker draws from, so `/status` and the routing decision cannot drift apart. They describe what the router would do *now*: a request riding an `x-session-affinity` pin bypasses the router entirely and follows none of it.
+- The numbers come from the same placement schedule the picker draws from, so `/status` and the routing decision cannot drift apart, and rendering them consumes no pick. They describe what the router would do *now*: a request riding an `x-session-affinity` pin bypasses the placement path entirely and follows none of it.
 
 ### Logging
 
@@ -283,10 +286,10 @@ Each request gets a span with a `request_id`; a client-supplied W3C `traceparent
 
 A caller that hangs up mid-request (closing the write half or the whole connection) is normal traffic, not a fault: it is logged at `debug` with the caller's address and counted in `sturnus_client_disconnects_total`, while genuine connection faults (such as a failed response write) stay at `error`.
 
-At `debug` each routed request also logs the decision behind its `INFO routing request` line: the alias, the candidate that won, and every candidate's share of the alias in that request's latency mode — the same numbers `/status` reports:
+At `debug` each routed request also logs the decision behind its `INFO routing request` line: the alias, the candidate that won, why it won, and every candidate's declared share of the alias — the same numbers `/status` reports:
 
 ```text
-DEBUG routing decision alias=fast provider=groq model=llama-3.3-70b mode="nonstreaming" shares=groq/llama-3.3-70b=77.0% openai/gpt-4o-mini=21.3% local/qwen3-32b=1.7%
+DEBUG routing decision alias=fast provider=groq model=llama-3.3-70b mode="nonstreaming" reason="fresh-by-weight" shares=groq/llama-3.3-70b=60.0% openai/gpt-4o-mini=20.0% local/qwen3-32b=20.0%
 ```
 
 ## Session affinity
@@ -309,40 +312,40 @@ response = client.chat.completions.create(
 
 Fully stateless — works across pods with no shared state. The pin is honored until the pinned candidate's error-rate EWMA breaches `error_threshold` (at the default smoothing, roughly two consecutive errors), at which point the header is ignored and a new provider is selected — check the updated `x-session-affinity` in the response. Unknown or malformed headers fall back to normal routing.
 
-A honored pin bypasses the router completely, and says so at `debug` (`session affinity pin honored, router bypassed` with the alias, provider and model) rather than looking like the weighted `routing decision` a routed request logs.
+A honored pin bypasses the placement path entirely, and its `debug` line says so — the same `routing decision` line, with `reason="explicit-pin"` and the alias, provider and model — rather than looking like the `reason="fresh-by-weight"` decision a routed request logs.
 
 ## How routing works
 
 1. Client sends `POST /v1/chat/completions` with `"model": "fast"`.
-2. Sidecar looks up the `fast` alias and computes each candidate's **effective latency**: its latency EWMA divided by its success-rate EWMA. A candidate erroring with probability `p` needs ~`1/(1-p)` attempts per success, so errors inflate effective latency the same way slowness does.
-3. Each candidate is weighted by `(best_effective / its_effective)^k` — `k` is `routing.exploit_k`, default 3.0 — so the best gets the bulk of traffic and worse ones a shrinking-but-nonzero share. A deterministic low-discrepancy sequence (golden-ratio Weyl sequence) turns those weights into picks.
-4. Because worse candidates always keep a small share, their EWMAs stay fresh — a provider that recovers (faster responses *or* errors stopping) wins traffic back automatically; a cold candidate (no latency data yet) probes at a quarter of the best candidate's rate, scaled by its success rate, until its first samples land.
-5. The `model` field is rewritten to the real model name, auth headers are set, and the request is forwarded.
-6. TTFC is measured at first chunk arrival and fed back into the EWMA; the response status (any non-2xx counts as an error, including upstream 4xx) feeds the success-rate EWMA.
+2. Sidecar looks up the `fast` alias and reads each candidate's declared `weight` (an integer, default 1). A candidate's share of the alias is `its weight / sum of weights` — that is the entire allocation policy, and nothing measured — latency, error rate, queue depth — scales it.
+3. A deterministic low-discrepancy sequence (the golden-ratio Weyl sequence) over the alias's pick counter turns those weights into picks: equal weights alternate exactly, a 2:1 pair splits 2:1 over a long run, and there is no RNG to seed, so a split is reproducible in a test and in a debug log.
+4. The `model` field is rewritten to the real model name, auth headers are set, and the request is forwarded.
+5. TTFC is measured at first chunk arrival and fed into the latency EWMA; the response status (any non-2xx counts as an error, including upstream 4xx) feeds the success-rate EWMA. Both are reported on `/status`, and neither feeds the pick.
 
-The best provider is exploited heavily while worse ones keep enough traffic to stay measured. A candidate's probe share shrinks with how bad it looks but is floored at 1%, so re-detecting a recovered provider costs at most ~100 requests — and during an outage at most ~1% of an alias's traffic is spent on the failing candidate.
+The share is written, not discovered: the 95% box is `weight = 19` beside `weight = 1`. The trade is explicit — the router does not notice on its own that a box has gotten slow or started erroring, because it is not looking. `/status` reports the latency and error-rate EWMAs so an operator can notice, and the fix is a `weight`.
 
-### Exploit sharpness: `routing.exploit_k`
+### The share a weight buys
 
-`k` is the one knob that changes how an alias's traffic is divided. It acts on the *ratio* of effective latencies, so it behaves identically whether candidates differ by 20ms or 2s. A candidate's share is its weight over its alias's total weight, where `weight = round(1000 * (best_effective / its_effective)^k)` floored at 10 units (1% of the best candidate's). For an alias of two candidates that means:
+For an alias of two candidates:
 
-| worse candidate | k = 3.0 (default) | k = 1.0 | k = 0.0 |
-|-----------------|-------------------|---------|---------|
-| 2x slower | 11.1% | 33.3% | 50% |
-| 5x slower | 1.0% | 16.7% | 50% |
-| hard-failing | 1.0% | 1.0% | 50% |
+| weights | preferred box | other box |
+|---------|---------------|-----------|
+| 1 : 1   | 50%           | 50%       |
+| 2 : 1   | 66.7%         | 33.3%     |
+| 3 : 1   | 75%           | 25%       |
+| 19 : 1  | 95%           | 5%        |
 
-Lower it when a healthy candidate is starved by a gap you consider noise; raise it when you want the best candidate to take as close to all of the traffic as the floor allows. The three 1.0% entries are the floor rather than the formula — their raw weights are 8, 1 and 0 units, each lifted to 10 — which is what guarantees every candidate stays measured.
+Every number is `weight / sum(weights)`, and `documented_share_table_matches_the_weighting` pins these rows against the arithmetic the router runs, so a change to the weighting fails a test rather than leaving this table describing arithmetic the code no longer runs. Weights allocate picks, and the Weyl stride is low-discrepancy rather than exact per window: over a short run the observed split drifts around the declared share, and `/status` reports the declared one.
 
-**k = 0 is an even split, not a safe one.** Raising every ratio to the power 0 makes each warm candidate weigh exactly 1000, so errors stop counting entirely: a hard-failing candidate keeps half the traffic of a two-candidate alias, and the probe floor never engages because no weight comes near it. The cold probe flattens with it, since `rate^0` is 1 — a candidate failing from the start still probes at the full quarter rate. What survives is outside the weighting: `error_threshold` still breaks `x-session-affinity` pins to that candidate and still reports it `degraded` on `/status`, but routing weights never consult the threshold.
+A candidate that should never serve is left out of the alias's list. `weight = 0` is a startup error naming the alias and the candidate, because the weighted draw has no way to express "never".
 
 ### What config cannot do
 
-The routing keys are `ewma_alpha`, `exploit_k` and `error_threshold`, alongside the timeouts and the body-size caps. There is no key for:
+The routing keys are `ewma_alpha` (the smoothing of the EWMAs `/status` reports) and `error_threshold` (the error-rate EWMA above which a session-affinity pin is broken), alongside the timeouts and the body-size caps. There is no key for:
 
+- **Making a measured number count.** Latency, error rate and queue depth are recorded and reported, and no weight is scaled by any of them. There is no sharpness knob to turn, and `routing.exploit_k` — the knob this design removed — is a startup error naming `weight` as its replacement, not a key that loads and does nothing.
 - **Disabling or bounding session affinity.** A caller-supplied `x-session-affinity` pin is honored for as long as it stays under `error_threshold` — there is no turn limit, and no setting ignores the header. A handful of long-lived sessions can therefore hold one candidate at 100% of their own traffic however idle it looks to the router.
-- **A per-candidate weight.** A candidate is a `provider` and a `model`; shares come only from what each has been observed doing. To prefer a provider, make it faster or route it under its own alias.
-- **The probe floor and the cold probe share.** Both are fixed: 1% of the best candidate's weight, a quarter of its rate. They bound how much traffic an outage eats and how fast a recovery is noticed, so they are not a tuning surface.
+- **A floor, a ceiling, or a preference a box carries.** Weight is declared per candidate inside one alias's list, so the same box can be `weight = 3` in one alias and `weight = 1` in another; there is no global preference, no floor keeping a broken box sampled, and no ceiling on a healthy one. The list is the policy.
 
 ## Docker
 

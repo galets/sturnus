@@ -24,33 +24,22 @@ their history lives in the git log and tags.
   that is blank, whitespace-padded, or non-ASCII — those are keys no client could
   ever present.
 - **`/status` now reports the router's arithmetic, not just its inputs.** Each
-  candidate carries `weight`, the integer weight it holds in its alias, and
-  `share`, the fraction of that alias's traffic it should be getting right now,
-  next to the `effective_latency_ms` both were derived from — under
-  `routing.streaming` and `routing.nonstreaming`, beside the latency EWMAs and
-  error rate that were already there. So "why is this box getting nothing?" is a
-  curl rather than an inference from a log excerpt, and the common non-answer is
-  visible too: a `share` of ~1% is the probe floor keeping a bad box sampled,
-  never `0`. The numbers come from the same weighted schedule the picker draws
-  from, so the endpoint and the routing decision cannot drift apart. Candidates
-  reachable through several aliases are now listed once per alias, since a share
-  only means something relative to the candidates it competes with there. At
-  `debug` a routed request logs the alias, the candidate that won, and every
-  candidate's share; a request riding an `x-session-affinity` pin instead logs
-  that it bypassed the router, with the provider and model, so a pin is not
-  mistaken for a weighted decision.
-- **`routing.exploit_k` is documented next to the other routing knobs.** The key
-  was accepted and validated but appeared in neither the README's config block
-  nor `config.example.toml`, so the main lever for an underutilized candidate
-  had to be rediscovered by reading the weighting code. Both now carry it with
-  its 3.0 default and a share table — a 2x-slower, a 5x-slower and a
-  hard-failing candidate, at 3.0, 1.0 and 0.0 — every number derived from the
-  arithmetic the router runs, probe floor included, and pinned by a test
-  (`documented_share_table_matches_the_weighting`). The README also states the
-  sharpness-0 caveat: an even split that stops counting errors, so a
-  hard-failing candidate keeps half the alias's traffic, and what config
-  *cannot* do — disable or bound session affinity, set a per-candidate weight,
-  or move the probe floor and cold probe share.
+  candidate carries `weight`, the integer weight it declares in its alias, and
+  `share`, the fraction of that alias's traffic that weight buys — under
+  `routing`, beside the latency EWMAs and error rate that were already there,
+  which now sit under `observed` with a note that they do not route. So "why is
+  this box getting this share?" is a curl rather than an inference from a log
+  excerpt, and the arithmetic on show is the whole policy:
+  `share = weight / sum(weights)`. The numbers come from the same placement
+  schedule the picker draws from, so the endpoint and the routing decision
+  cannot drift apart, and rendering them consumes no pick — a scrape cannot
+  perturb the routing it reports. Candidates reachable through several aliases
+  are now listed once per alias, since a share only means something relative to
+  the candidates it competes with there. At `debug` a routed request logs the
+  alias, the candidate that won, the reason (`fresh-by-weight`), and every
+  candidate's declared share; a request riding an `x-session-affinity` pin logs
+  the same line with `reason="explicit-pin"`, so a pin is not mistaken for a
+  weighted decision.
 - **How many requests a candidate has outstanding right now.** `/status` lists
   `in_flight` per candidate and `/metrics` exports
   `sturnus_in_flight_requests`, a gauge labelled by `alias`, `provider` and
@@ -67,12 +56,38 @@ their history lives in the git log and tags.
   series. The point is to make queueing visible before any routing change reacts
   to it: an agent that fires a same-instant pair of requests shows both of them
   waiting on one box while the alias's other candidate sits at zero, which
-  latency-only routing notices only once latency has already degraded. A box
+  nothing in the router acts on today: the count is visible before any placement
+  rule consults it. A box
   reachable through several aliases reports the same number under each of its
   label sets, because it is one box's queue.
 
 ### Changed
 
+- **Breaking: an alias's traffic is divided by declared `weight`, not by
+  measured latency.** Every candidate of an alias takes an integer `weight`
+  (default 1) and its share of that alias is `weight / sum(weights)`; nothing
+  measured — latency, error rate, queue depth — scales it. The measured
+  allocator is out of the routing path: exploit sharpness, effective-latency
+  weighting, the probe floor and the cold-probe share. A config that still sets
+  `routing.exploit_k` therefore fails at startup, naming the key and what
+  replaced it, rather than loading and tuning nothing:
+
+  ```text
+  routing.exploit_k is no longer used: traffic is allocated by each candidate's
+  declared `weight` (an integer, default 1) in the [model] alias list; remove exploit_k
+  ```
+
+  The migration is to write the split down. The box that a 2x latency gap and
+  `exploit_k = 3.0` gave 11% of an alias is `weight = 19` beside `weight = 1` to
+  give it 95%. Latency and success-rate EWMAs are still recorded and `/status`
+  still shows them, under `observed`, labelled as not used for routing: noticing
+  a box that has quietly gotten slow is, in this design, a human reading a
+  number and changing a `weight`. A candidate that should get nothing is left
+  out of the alias's list — `weight = 0` is a startup error naming the alias and
+  the candidate, because the weighted draw has no way to express "never". Picks
+  come from a golden-ratio Weyl sequence over the alias's counter, so equal
+  weights alternate exactly and a declared ratio holds over a long run, with no
+  RNG to seed.
 - **Breaking (bare-metal):** the default config location is now
   `$HOME/.config/sturnus.toml` rather than `./config.toml` in the working
   directory. `--config` is unchanged and still overrides it. If `HOME` is
