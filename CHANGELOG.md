@@ -132,6 +132,21 @@ and `config.example.toml` carries every one of them.
   turn. One conversation is warm per box, which is why the pin is at box
   granularity: [ADR 0002](docs/adr/0002-pin-the-box-not-the-llama-cpp-slot.md)
   records the measurements and why the router does not steer llama.cpp slots.
+- **`x-session-id` is accepted in place of `x-session-affinity`.** A caller that
+  already carries its conversation id under `x-session-id` gets the same affinity
+  from it: the router reads `x-session-affinity` first and falls back to
+  `x-session-id` only when that header is absent, so nothing an existing client
+  sends changes. The name is not the instruction — both shapes work under either
+  header, so a `provider/model` under `x-session-id` is an explicit pin and any
+  other usable value is a session key — and when a request carries both names the
+  first is the one read, because that is the name every response is echoed under.
+  The `debug` routing line gains `affinity_header=`, naming the header the
+  decision was read from: `x-session-affinity`, `x-session-id` when only that one
+  was present, and empty when the request carried neither and the turn was
+  placed. So "which of my headers is this proxy listening to?" is answered from
+  the log rather than by experiment; a header that carried no usable value still
+  names itself there, beside the `reason` that shows the placement it fell
+  through to.
 - **The inputs to a placement are logged beside its outcome.** The `debug`
   routing line gains `load=`, listing every candidate of the alias as
   `provider/model=w3,t1,busy` — the weight it declares, the turns it has

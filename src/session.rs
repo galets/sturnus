@@ -81,7 +81,11 @@ pub const DEFAULT_TABLE_LIMIT: usize = 1024;
 /// in the table.
 pub const MAX_SESSION_KEY_BYTES: usize = 256;
 
-/// What an `x-session-affinity` header value asked for, discriminated by shape.
+/// What the affinity header asked for, discriminated by shape.
+///
+/// The value arrives under `x-session-affinity`, or under `x-session-id` when
+/// that one is absent (see [`crate::server`]): the name changes nothing about
+/// what a value means, only where it was read from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Affinity<'a> {
     /// A `provider/model` pair: the caller naming one specific box. Checked
@@ -100,6 +104,10 @@ pub enum Affinity<'a> {
 /// as an unusable header always has. A value containing `/` is the explicit
 /// pin, exactly as it was before session keys existed — including the case
 /// where it names no candidate of the alias, which is not a pin either.
+///
+/// The name the value arrived under is not this function's business: it reads
+/// the value it is handed, whether that came from `x-session-affinity` or from
+/// `x-session-id` in its place.
 pub fn classify(value: Option<&HeaderValue>) -> Option<Affinity<'_>> {
     let value = value?.to_str().ok()?;
     if let Some((provider, model)) = value.split_once('/') {

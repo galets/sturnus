@@ -24,6 +24,15 @@ use crate::router::{self, Placed, Placement, RoundRobinState};
 use crate::session::{self, SessionTable};
 use crate::tracker::{self, LatencyMode, Tracker};
 
+/// The header affinity arrives under, and the name this proxy echoes on every
+/// response.
+const AFFINITY_HEADER: &str = "x-session-affinity";
+
+/// The name accepted in place of [`AFFINITY_HEADER`] when that one is absent:
+/// callers that carry their conversation id under `x-session-id` get the same
+/// affinity from it, with the same shapes.
+const SESSION_ID_HEADER: &str = "x-session-id";
+
 pub struct AppState {
     pub model_map: ModelMap,
     pub tracker: Tracker,
@@ -183,7 +192,22 @@ pub async fn handle_request(
         }
     }
 
-    let affinity_header = req.headers_mut().remove("x-session-affinity");
+    // Affinity arrives under one of two names, and which one is worth logging:
+    // `x-session-affinity` is the header this proxy echoes, and `x-session-id`
+    // is read in its place for a caller that carries its conversation id under
+    // that name. The name present first wins, so a caller that sends both is
+    // read under the name this proxy answers with. The value is read once, from
+    // that one header, and the name it came under rides the routing decision
+    // log below.
+    let affinity_header = req
+        .headers_mut()
+        .remove(AFFINITY_HEADER)
+        .map(|value| (AFFINITY_HEADER, value))
+        .or_else(|| {
+            req.headers_mut()
+                .remove(SESSION_ID_HEADER)
+                .map(|value| (SESSION_ID_HEADER, value))
+        });
 
     let max_body = state.budget.max_body_bytes;
 
@@ -277,11 +301,11 @@ pub async fn handle_request(
         ));
     };
 
-    // The header's shape says what it asks for: a `provider/model` value names
-    // one box outright, anything else is a session key. An absent,
-    // unprintable, blank or over-long value is no instruction at all, and the
-    // turn is placed.
-    let affinity = session::classify(affinity_header.as_ref());
+    // The value's shape says what it asks for, under either name: a
+    // `provider/model` value names one box outright, anything else is a session
+    // key. An absent, unprintable, blank or over-long value is no instruction at
+    // all, and the turn is placed.
+    let affinity = session::classify(affinity_header.as_ref().map(|(_, value)| value));
     let session_key = match affinity {
         Some(session::Affinity::SessionKey(key)) => Some(key),
         _ => None,
@@ -346,6 +370,14 @@ pub async fn handle_request(
             model = %placed.candidate.model,
             mode = latency_mode.as_str(),
             reason = placed.reason.as_str(),
+            // Which header, if any, this decision was made from:
+            // `x-session-affinity`, `x-session-id` when only that one was
+            // present, and empty when the request carried neither and the turn
+            // was placed. A header that was present but unusable — blank,
+            // unprintable, over-long, a `provider/model` that names no
+            // candidate of this alias — still names itself here, and the reason
+            // on this line is the placement it fell through to.
+            affinity_header = affinity_header.as_ref().map_or("", |header| header.0),
             // The session key, when the request carried one: the identity the
             // pin is stored under, so "why this box for this conversation?" is
             // answerable from the log. Empty when the turn had no session.
@@ -482,7 +514,7 @@ pub async fn handle_request(
             let headers = resp.headers_mut();
             headers.extend(proxy_result.headers);
             headers.insert("x-sturnus-provider", candidate.provider_header.clone());
-            headers.insert("x-session-affinity", candidate.affinity_header.clone());
+            headers.insert(AFFINITY_HEADER, candidate.affinity_header.clone());
             Ok(resp)
         }
         Err(e) => {

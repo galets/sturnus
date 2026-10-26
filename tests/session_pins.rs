@@ -6,7 +6,10 @@
 //! the two surfaces an operator and a client actually have: the
 //! `x-session-affinity` header echoed on every response, and the session
 //! counts on `/status`. The identity is the request header's *shape* — a value
-//! containing `/` names a box outright, anything else is a session key.
+//! containing `/` names a box outright, anything else is a session key — and
+//! the shape is read from `x-session-affinity` or, when that name is absent,
+//! from `x-session-id`, so the tests cover both names, which one wins when a
+//! caller sends both, and what the routing decision logs about it.
 //!
 //! The rules under test are the ones the glossary states: a session key's
 //! first turn is a **fresh pick** by weight and busyness, every later turn
@@ -186,22 +189,27 @@ fn streaming_request(alias: &str) -> serde_json::Value {
     serde_json::json!({"model": alias, "messages": [], "stream": true})
 }
 
-/// One turn through the proxy: its status, the box that served it, and the
-/// `x-session-affinity` value echoed back.
+/// One turn through the proxy carrying `headers` as its affinity headers, and
+/// returning its status, the box that served it, and the `x-session-affinity`
+/// value echoed back.
 ///
 /// The echo is the stateless half of affinity — a cooperating client can pin
 /// across replicas with it and never touch this instance's table — so every
 /// test here reads it, and a response that stopped echoing it fails.
-async fn turn(
+///
+/// The headers are passed through so a test can name the header it sends:
+/// `x-session-affinity` is the name this proxy echoes, and `x-session-id` is
+/// accepted in its place.
+async fn turn_with(
     addr: std::net::SocketAddr,
     alias: &str,
-    session: Option<&str>,
+    headers: &[(&str, &str)],
 ) -> (u16, String, String) {
     let mut req = caller_client()
         .post(format!("http://{addr}/v1/chat/completions"))
         .json(&request(alias));
-    if let Some(session) = session {
-        req = req.header("x-session-affinity", session);
+    for (name, value) in headers {
+        req = req.header(*name, *value);
     }
     let resp = req.send().await.unwrap();
     let header = |name: &str| {
@@ -215,6 +223,36 @@ async fn turn(
         header("x-sturnus-provider"),
         header("x-session-affinity"),
     )
+}
+
+/// One turn under `x-session-affinity`, as a cooperating client sends it.
+async fn turn(
+    addr: std::net::SocketAddr,
+    alias: &str,
+    session: Option<&str>,
+) -> (u16, String, String) {
+    let headers: Vec<(&str, &str)> = session
+        .map(|value| vec![("x-session-affinity", value)])
+        .unwrap_or_default();
+    turn_with(addr, alias, &headers).await
+}
+
+/// One turn carrying both affinity header names at once.
+async fn turn_under_both(
+    addr: std::net::SocketAddr,
+    alias: &str,
+    affinity: &str,
+    session_id: &str,
+) -> (u16, String, String) {
+    turn_with(
+        addr,
+        alias,
+        &[
+            ("x-session-affinity", affinity),
+            ("x-session-id", session_id),
+        ],
+    )
+    .await
 }
 
 /// A streamed turn, returned as the response whose body is still arriving.
@@ -716,6 +754,136 @@ async fn a_malformed_unusable_or_absent_header_falls_back_to_placement() {
 }
 
 // ---------------------------------------------------------------------------
+// `x-session-id` in place of `x-session-affinity`
+// ---------------------------------------------------------------------------
+
+/// A caller that carries its conversation id under `x-session-id` gets the same
+/// affinity as one that sends it under `x-session-affinity`: the first turn is a
+/// fresh pick, every later turn rides the pin, and the response keeps echoing
+/// `x-session-affinity` — the name this proxy answers with.
+#[tokio::test]
+async fn an_x_session_id_header_pins_the_session_like_the_affinity_header() {
+    let (alpha_port, alpha_up) = eager_upstream().await;
+    let (beta_port, beta_up) = eager_upstream().await;
+    let state = state_for(&alpha_and_beta(alpha_port, beta_port), caller_client());
+    let (addr, _shutdown) = start_server(state);
+
+    for turn_number in 1..=4 {
+        let (status, provider, echo) =
+            turn_with(addr, "fast", &[("x-session-id", "ses_by_id")]).await;
+        assert_eq!(status, 200, "turn {turn_number} was served");
+        assert_eq!(
+            (provider.as_str(), echo.as_str()),
+            ("alpha", "alpha/m-alpha"),
+            "turn {turn_number}: placed on alpha by weight, and pinned there"
+        );
+    }
+
+    // One session, on one box, from a header the pinning tests never sent.
+    assert_eq!(sessions_pinned(addr, "alpha").await, 1);
+    assert_eq!(sessions_pinned(addr, "beta").await, 0);
+    assert_eq!(sessions_block(addr).await.0, 1);
+
+    alpha_up.abort();
+    beta_up.abort();
+}
+
+/// The fallback is a drop-in, so its other shape is a drop-in too: a
+/// `provider/model` under `x-session-id` names a box outright, is honored over
+/// a session's own pin, and pins nothing of its own.
+#[tokio::test]
+async fn an_x_session_id_naming_a_box_is_an_explicit_pin() {
+    let (alpha_port, alpha_up) = eager_upstream().await;
+    let (beta_port, beta_up) = eager_upstream().await;
+    let state = state_for(&alpha_and_beta(alpha_port, beta_port), caller_client());
+    let (addr, _shutdown) = start_server(state);
+
+    // The session is pinned to alpha by weight, under the primary name.
+    let (_, provider, _) = turn(addr, "fast", Some("ses_steady")).await;
+    assert_eq!(provider, "alpha");
+
+    // `x-session-id` carrying the explicit shape: the caller names beta, and
+    // gets it, over the session's pin and over the weight.
+    let (status, provider, echo) =
+        turn_with(addr, "fast", &[("x-session-id", "beta/m-beta")]).await;
+    assert_eq!(
+        (status, provider.as_str(), echo.as_str()),
+        (200, "beta", "beta/m-beta"),
+        "the fallback header carries an explicit pin as well as a session key"
+    );
+
+    // The session is still alpha's: an explicit turn re-pins nothing, and the
+    // box named under the fallback name is not a session.
+    let (_, provider, _) = turn(addr, "fast", Some("ses_steady")).await;
+    assert_eq!(provider, "alpha");
+    assert_eq!(
+        sessions_block(addr).await.0,
+        1,
+        "only the session's own pin"
+    );
+    assert_eq!(sessions_pinned(addr, "beta").await, 0);
+
+    alpha_up.abort();
+    beta_up.abort();
+}
+
+/// Both names present: `x-session-affinity` is the one read, and the
+/// `x-session-id` beside it is not consulted at all — it pins nothing, and
+/// every turn keeps going where the header this proxy answers with says.
+#[tokio::test]
+async fn the_affinity_header_is_read_in_preference_to_a_session_id() {
+    let (alpha_port, alpha_up) = eager_upstream().await;
+    let (beta_port, beta_up) = eager_upstream().await;
+    let state = state_for(&alpha_and_beta(alpha_port, beta_port), caller_client());
+    let (addr, _shutdown) = start_server(state);
+
+    // The affinity header names beta outright; the session id beside it asks
+    // for a pin, which is never looked at.
+    for turn_number in 1..=3 {
+        let (status, provider, echo) =
+            turn_under_both(addr, "fast", "beta/m-beta", "ses_ignored").await;
+        assert_eq!(
+            (status, provider.as_str(), echo.as_str()),
+            (200, "beta", "beta/m-beta"),
+            "turn {turn_number}: the primary header decides, alone"
+        );
+    }
+
+    // The ignored name pinned nothing, so the table is empty.
+    assert_eq!(sessions_block(addr).await.0, 0);
+    assert_eq!(sessions_pinned(addr, "beta").await, 0);
+
+    alpha_up.abort();
+    beta_up.abort();
+}
+
+/// A `x-session-id` with no usable value is no instruction, exactly as an
+/// unusable `x-session-affinity` value: the turn is placed and nothing pins.
+#[tokio::test]
+async fn an_unusable_x_session_id_falls_back_to_placement() {
+    let (alpha_port, alpha_up) = eager_upstream().await;
+    let (beta_port, beta_up) = eager_upstream().await;
+    let state = state_for(&alpha_and_beta(alpha_port, beta_port), caller_client());
+    let (addr, _shutdown) = start_server(state);
+
+    let long_key = "s".repeat(300);
+    for case in ["", "   ", long_key.as_str()] {
+        let (status, provider, echo) = turn_with(addr, "fast", &[("x-session-id", case)]).await;
+        assert_eq!(
+            (status, provider.as_str()),
+            (200, "alpha"),
+            "{case:?} should fall through to placement"
+        );
+        assert_eq!(echo, "alpha/m-alpha", "{case:?}");
+    }
+
+    assert_eq!(sessions_block(addr).await.0, 0);
+
+    alpha_up.abort();
+    beta_up.abort();
+}
+
+// ---------------------------------------------------------------------------
 // Overflow re-pins
 // ---------------------------------------------------------------------------
 
@@ -1005,6 +1173,110 @@ async fn a_turn_with_no_session_key_logs_no_session() {
         assert!(
             line.contains(r#"session="""#),
             "an anonymous turn names no session: {line}"
+        );
+    })
+    .await;
+
+    alpha_up.abort();
+    beta_up.abort();
+}
+
+/// The routing decision names the header it read, so "which of my headers is
+/// this proxy listening to?" is answerable from the same line that answers
+/// "why this box?": the name it used, `x-session-id` when only that one was
+/// present, and nothing when the request carried neither.
+#[tokio::test(flavor = "current_thread")]
+async fn the_routing_decision_logs_which_affinity_header_it_read() {
+    let logs = CapturedLogs::default();
+    let (alpha_port, alpha_up) = eager_upstream().await;
+    let (beta_port, beta_up) = eager_upstream().await;
+    let state = state_for(&alpha_and_beta(alpha_port, beta_port), caller_client());
+    let (addr, _shutdown) = start_server(state);
+
+    capture_logs(logs.clone(), async move {
+        turn_with(addr, "fast", &[("x-session-affinity", "ses_log_primary")]).await;
+        turn_with(addr, "fast", &[("x-session-id", "ses_log_fallback")]).await;
+        turn_under_both(addr, "fast", "beta/m-beta", "ses_log_both").await;
+        turn_with(addr, "fast", &[]).await;
+
+        let text = wait_for_log(&logs, Duration::from_secs(3), |t| {
+            t.contains(r#"affinity_header="" session="""#)
+        })
+        .await;
+
+        let line_with = |needle: &str| {
+            text.lines()
+                .find(|line| line.contains("routing decision") && line.contains(needle))
+                .unwrap_or_else(|| panic!("no routing decision line for {needle:?} in:\n{text}"))
+                .to_string()
+        };
+
+        let primary = line_with(r#"session="ses_log_primary""#);
+        assert!(
+            primary.contains(r#"affinity_header="x-session-affinity""#),
+            "the primary name names itself: {primary}"
+        );
+
+        let fallback = line_with(r#"session="ses_log_fallback""#);
+        assert!(
+            fallback.contains(r#"affinity_header="x-session-id""#),
+            "the fallback name names itself: {fallback}"
+        );
+
+        // Both names present: the line says the primary one was the one read,
+        // and the session id beside it is not in the line at all.
+        let both = line_with(r#"reason="explicit-pin""#);
+        assert!(
+            both.contains(r#"affinity_header="x-session-affinity""#)
+                && both.contains(r#"session="""#),
+            "the primary name wins, and the ignored session id logs nothing: {both}"
+        );
+
+        // The anonymous turn is the line that names no header and no session.
+        let anonymous = line_with(r#"affinity_header="" session="""#);
+        assert!(
+            anonymous.contains(r#"affinity_header="""#),
+            "a turn that carried neither header names no header: {anonymous}"
+        );
+    })
+    .await;
+
+    alpha_up.abort();
+    beta_up.abort();
+}
+
+/// A header that carries no usable instruction still names itself in the log,
+/// and the reason on that line is the placement it fell through to: the field
+/// says what was read, the reason says what was decided.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unusable_header_names_itself_beside_the_placement_it_fell_through_to() {
+    let logs = CapturedLogs::default();
+    let (alpha_port, alpha_up) = eager_upstream().await;
+    let (beta_port, beta_up) = eager_upstream().await;
+    let state = state_for(&alpha_and_beta(alpha_port, beta_port), caller_client());
+    let (addr, _shutdown) = start_server(state);
+
+    capture_logs(logs.clone(), async move {
+        // Blank under the fallback name: no session, so the turn is placed, and
+        // weight (19:1) names alpha.
+        assert_eq!(
+            turn_with(addr, "fast", &[("x-session-id", "   ")]).await.1,
+            "alpha"
+        );
+
+        let text = wait_for_log(&logs, Duration::from_secs(3), |t| {
+            t.contains("routing decision")
+        })
+        .await;
+        let line = text
+            .lines()
+            .find(|line| line.contains("routing decision"))
+            .unwrap_or_else(|| panic!("no routing decision line in:\n{text}"));
+        assert!(
+            line.contains(r#"affinity_header="x-session-id""#)
+                && line.contains(r#"reason="fresh-by-weight""#)
+                && line.contains(r#"session="""#),
+            "the unusable header names itself beside the placement it fell to: {line}"
         );
     })
     .await;
