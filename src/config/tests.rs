@@ -157,6 +157,61 @@ exploit_k = 3.0
     assert!(err.contains("weight"), "{err}");
 }
 
+/// A config written for the error-rate feedback loop must fail loudly, not
+/// silently mean something else. The message names `demotion_secs`, because
+/// that is the key that now decides how long a box is out of rotation.
+#[test]
+fn a_stale_error_threshold_is_rejected_naming_its_replacement() {
+    let toml_str = r#"
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini" }]
+
+[routing]
+error_threshold = 0.5
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    let err = config.validate().unwrap_err().to_string();
+    assert!(err.contains("routing.error_threshold"), "{err}");
+    assert!(err.contains("demotion_secs"), "{err}");
+}
+
+#[test]
+fn the_demotion_window_defaults_to_ten_seconds() {
+    let toml_str = r#"
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini" }]
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.routing.demotion_secs, 10);
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn an_explicit_demotion_window_is_parsed() {
+    let toml_str = r#"
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini" }]
+
+[routing]
+demotion_secs = 45
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.routing.demotion_secs, 45);
+    assert!(config.validate().is_ok());
+}
+
 #[test]
 fn a_candidate_weight_defaults_to_one() {
     let toml_str = r#"

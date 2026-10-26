@@ -156,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
-    let mut tracker = Tracker::new(config.routing.ewma_alpha, config.routing.error_threshold);
+    let mut tracker = Tracker::new(config.routing.ewma_alpha, config.routing.demotion_secs);
     let model_map = ModelMap::from_config(&config, &mut tracker)?;
 
     let mut rr_state = RoundRobinState::new();

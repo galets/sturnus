@@ -42,7 +42,7 @@ fn state_from_config(config_toml: &str, budget_kb: usize) -> Arc<AppState> {
     sturnus::init_crypto();
     let config: sturnus::config::Config = toml::from_str(config_toml).unwrap();
 
-    let mut tracker = Tracker::new(0.3, 0.5);
+    let mut tracker = Tracker::new(0.3, 10);
     let model_map = ModelMap::from_config(&config, &mut tracker).unwrap();
     let mut rr_state = RoundRobinState::new();
     for alias in config.model.keys() {
@@ -654,7 +654,7 @@ fast = [
     ))
     .unwrap();
 
-    let mut tracker = Tracker::new(0.3, 0.5);
+    let mut tracker = Tracker::new(0.3, 10);
     let model_map = ModelMap::from_config(&config, &mut tracker).unwrap();
     let mut rr_state = RoundRobinState::new();
     for alias in config.model.keys() {
@@ -724,14 +724,15 @@ fast = [
     handle_b.abort();
 }
 
+/// Nothing breaks an explicit pin. The error-rate threshold that used to break
+/// pins is gone, so a box that has failed five times in a row still serves the
+/// session that named it: the operator's choice outranks the proxy's opinion.
 #[tokio::test]
-async fn affinity_pin_broken_when_error_ewma_breaches_threshold() {
+async fn an_explicit_pin_is_honoured_while_its_box_keeps_failing() {
     sturnus::init_crypto();
-    let (port_a, handle_a) = instant_upstream(0).await;
-    let (port_b, handle_b) = instant_upstream(1).await;
+    let (port_a, handle_a) = instant_upstream(1).await;
+    let (port_b, handle_b) = instant_upstream(0).await;
 
-    // beta listed first: the first Weyl tick lands on the first weight
-    // unit, which would be alpha's probe slice otherwise.
     let config: sturnus::config::Config = toml::from_str(&format!(
         r#"
 [provider.alpha]
@@ -751,7 +752,7 @@ fast = [
     ))
     .unwrap();
 
-    let mut tracker = Tracker::new(0.3, 0.5);
+    let mut tracker = Tracker::new(0.3, 10);
     let model_map = ModelMap::from_config(&config, &mut tracker).unwrap();
     let mut rr_state = RoundRobinState::new();
     for alias in config.model.keys() {
@@ -770,7 +771,7 @@ fast = [
         .unwrap()
         .stats_index;
 
-    // alpha warm but failing (error EWMA > 0.5); beta healthy.
+    // alpha warm and failing, beta healthy: the shape that used to break a pin.
     tracker.record_success(
         alpha_idx,
         LatencyMode::NonStreaming,
@@ -798,7 +799,7 @@ fast = [
     });
     let (addr, _tx, _server) = start_server(state);
 
-    // Pin to the failing provider: must break and re-route.
+    // Pin to the failing provider: it is honored, and alpha answers.
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/v1/chat/completions"))
         .header("x-session-affinity", "alpha/test-model")
@@ -814,8 +815,8 @@ fast = [
         .to_str()
         .unwrap();
     assert_eq!(
-        provider, "beta",
-        "pin to a candidate above the error threshold should be broken"
+        provider, "alpha",
+        "a pin is honored whatever the pinned box's error rate"
     );
     let affinity = resp
         .headers()
@@ -823,7 +824,7 @@ fast = [
         .unwrap()
         .to_str()
         .unwrap();
-    assert_eq!(affinity, "beta/test-model");
+    assert_eq!(affinity, "alpha/test-model");
 
     handle_a.abort();
     handle_b.abort();

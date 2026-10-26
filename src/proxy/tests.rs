@@ -221,7 +221,7 @@ fn sanitize_headers_strips_unsafe_and_preserves_rest() {
 /// what happens to a response body when the caller hangs up mid-stream.
 #[tokio::test]
 async fn dropping_a_counted_stream_mid_flight_returns_the_in_flight_count() {
-    let mut tracker = Tracker::new(0.3, 0.5);
+    let mut tracker = Tracker::new(0.3, 10);
     let idx = tracker.register();
     let counted = Counted {
         inner: Box::pin(stream::pending::<Result<Frame<Bytes>, Infallible>>()),
@@ -249,7 +249,7 @@ async fn dropping_a_counted_stream_mid_flight_returns_the_in_flight_count() {
 /// for a request that is still running.
 #[tokio::test]
 async fn a_counted_stream_returns_its_count_once_when_the_relay_ends() {
-    let mut tracker = Tracker::new(0.3, 0.5);
+    let mut tracker = Tracker::new(0.3, 10);
     let idx = tracker.register();
     // Held until the end of the test: this request is never finished with, so
     // the count can only ever come down by one, and it must stop at one.
@@ -286,7 +286,7 @@ async fn a_counted_stream_returns_its_count_once_when_the_relay_ends() {
 /// SSE error event and ends, and the count goes with it.
 #[tokio::test]
 async fn a_counted_stream_returns_its_count_when_the_upstream_stream_errors() {
-    let mut tracker = Tracker::new(0.3, 0.5);
+    let mut tracker = Tracker::new(0.3, 10);
     let idx = tracker.register();
     let source: Vec<Result<Bytes, String>> = vec![
         Ok(Bytes::from_static(b"data: {\"chunk\":1}\n\n")),

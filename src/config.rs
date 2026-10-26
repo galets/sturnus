@@ -212,9 +212,16 @@ pub struct RoutingConfig {
     /// any config that sets it.
     #[serde(default)]
     pub exploit_k: Option<f64>,
-    /// Error-rate EWMA above which a session-affinity pin is broken.
-    /// Routing weights never consult it.
-    pub error_threshold: f64,
+    /// Accepted so a stale config is *reported* rather than silently ignored:
+    /// the error-rate threshold that broke session-affinity pins is gone, and
+    /// `validate` rejects any config that sets it.
+    #[serde(default)]
+    pub error_threshold: Option<f64>,
+    /// Seconds a candidate takes no new sessions after a transport failure —
+    /// connect, DNS, TLS, connect timeout, read timeout. An upstream 4xx/5xx
+    /// is a box that answered, so it relays and does not demote. `0` asks for
+    /// no window at all.
+    pub demotion_secs: u64,
     pub connect_timeout_secs: u64,
     pub read_timeout_secs: u64,
     /// Maximum request body size in bytes; larger requests 413.
@@ -234,7 +241,8 @@ impl Default for RoutingConfig {
         Self {
             ewma_alpha: 0.3,
             exploit_k: None,
-            error_threshold: 0.5,
+            error_threshold: None,
+            demotion_secs: 10,
             connect_timeout_secs: 10,
             read_timeout_secs: 60,
             max_body_bytes: 32 * 1024 * 1024, // 32 MB
@@ -400,10 +408,18 @@ impl Config {
                  alias list; remove exploit_k"
             );
         }
-        if !(0.0..=1.0).contains(&self.routing.error_threshold) {
+        if self.routing.error_threshold.is_some() {
+            // Same shape as `exploit_k` above: the key is gone, and a config
+            // that sets it must not load and tune nothing. The threshold was
+            // the one thing that broke a session-affinity pin, so removing it
+            // changes behaviour an operator may have been relying on — the
+            // message says what replaced it.
             anyhow::bail!(
-                "error_threshold must be between 0.0 and 1.0, got {}",
-                self.routing.error_threshold
+                "routing.error_threshold is no longer used: a transport failure \
+                 (connect, DNS, TLS, connect timeout, read timeout) demotes a \
+                 candidate for `routing.demotion_secs` seconds (default 10), an \
+                 upstream 4xx/5xx is relayed and does not demote, and a pin is \
+                 honored whatever the pinned box's error rate; remove error_threshold"
             );
         }
         for (name, p) in &self.provider {

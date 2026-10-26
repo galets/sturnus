@@ -59,6 +59,7 @@ response = client.chat.completions.create(
 ## Features
 
 - **Declared-weight routing** — every candidate of an alias declares an integer `weight` (default 1) and gets `weight / sum(weights)` of that alias's traffic. The split is the arithmetic the config states, drawn deterministically, and nothing measured — latency, error rate, queue depth — scales it. Latency and success-rate EWMAs are still recorded and shown on `/status`, labelled as not used for routing.
+- **Demotion on transport failure** — a box that cannot be reached (connect, DNS, TLS, connect timeout, read timeout) takes no new sessions for `routing.demotion_secs` (default 10) and is fully eligible again when the window ends. A box that answers is a box that is up: an upstream `4xx`/`5xx` is relayed verbatim and does not demote. The health model is a timer, not a feedback loop — nothing probes a demoted box, no share is reserved for it, and it does not win traffic back gradually.
 - **Session affinity** — a stateless `x-session-affinity` header pins follow-up requests to the same provider across pods.
 - **Transparent passthrough** — only the `model` field is rewritten: the request body is otherwise forwarded byte-for-byte, preserving key order, number precision, and formatting. Responses, including SSE `text/event-stream` chunks, are relayed untouched as they arrive.
 - **Memory-bounded** — request buffers are capped per request and in aggregate; bursts beyond the memory budget shed load with `429` + `Retry-After` instead of OOMing the pod.
@@ -123,12 +124,15 @@ fast = [
 
 [routing]
 ewma_alpha = 0.3          # smoothing for the latency and success-rate EWMAs, which /status reports and routing ignores
-error_threshold = 0.5      # error-rate EWMA above which a session-affinity pin is broken
+demotion_secs = 10         # seconds an unreachable box takes no new sessions for
 ```
 
 See [`config.example.toml`](config.example.toml) for all providers (Groq, Azure, Google AI Studio, Anthropic, local OpenAI-compatible) and options.
 
-A config that still sets `routing.exploit_k` — the sharpness of the measured allocator this design replaced — fails at startup naming `weight` as its replacement, rather than loading and tuning nothing.
+A config that still sets a key this design removed fails at startup naming the key and its replacement, rather than loading and tuning nothing:
+
+- `routing.exploit_k` — the sharpness of the measured allocator — names `weight`.
+- `routing.error_threshold` — the error-rate EWMA above which a session-affinity pin was broken — names `demotion_secs`.
 
 Environment variables in `${VAR}` syntax are interpolated at config load time. Where they're available in an `.env` file (`KEY=VALUE` per line), pass it with `--env-file`:
 
@@ -227,6 +231,8 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
   "candidates": [
     {
       "alias": "fast",
+      "busy": true,
+      "demotion_secs_left": null,
       "in_flight": 2,
       "model": "llama-3.3-70b",
       "observed": {
@@ -236,11 +242,16 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
         "streaming_ewma_ms": 131
       },
       "provider": "groq",
-      "routing": { "share": 0.6, "weight": 3 },
+      "routing": {
+        "share": 0.6,
+        "weight": 3
+      },
       "status": "warm"
     },
     {
       "alias": "fast",
+      "busy": false,
+      "demotion_secs_left": null,
       "in_flight": 0,
       "model": "gpt-4o-mini",
       "observed": {
@@ -250,11 +261,16 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
         "streaming_ewma_ms": 200
       },
       "provider": "openai",
-      "routing": { "share": 0.2, "weight": 1 },
+      "routing": {
+        "share": 0.2,
+        "weight": 1
+      },
       "status": "warm"
     },
     {
       "alias": "fast",
+      "busy": false,
+      "demotion_secs_left": 10,
       "in_flight": 0,
       "model": "qwen3-32b",
       "observed": {
@@ -264,16 +280,21 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
         "streaming_ewma_ms": null
       },
       "provider": "local",
-      "routing": { "share": 0.2, "weight": 1 },
-      "status": "degraded"
+      "routing": {
+        "share": 0.2,
+        "weight": 1
+      },
+      "status": "demoted"
     }
   ]
 }
 ```
 
-- **`status`** — `cold` (no latency sample in either mode yet), `warm`, or `degraded` (its error-rate EWMA has passed `error_threshold`, which is also what breaks session-affinity pins to it).
-- **`in_flight`** — requests this candidate has outstanding right now, counted from the moment it is chosen (by the router or by an `x-session-affinity` pin) until its response ends, errors, or is dropped mid-flight, so the wait it covers includes connecting, uploading, TTFB and the stream itself. It is one count per box, so a candidate listed under several aliases shows the same number in every entry, and `0` means nothing is in flight. Read it against `share`: several requests queued on a candidate whose share says it should be getting a fifth of the alias is congestion the router does not act on — busyness is not an input to placement yet, so the queue is visible, not routed around.
-- **`routing`** — the whole allocation policy, as declared: `weight` is the integer the config gave this candidate in this alias, and `share` is that weight over the alias's total weight. Nothing measured scales it. The `local` row above is the point of the design: it is `degraded` with a 76% error-rate EWMA, and its share is exactly what its weight declares, because a share is not something the router discovers.
+- **`status`** — `cold` (no latency sample in either mode yet), `warm`, or `demoted` (a transport failure started its window; it takes no new sessions until the window ends). `demoted` outranks the latency states, because "this box takes nothing for 7s" is the actionable fact and a `weight` change is not the answer to it.
+- **`demotion_secs_left`** — whole seconds left in that window, rounded up so a reading never understates what is left, and `null` when the candidate is eligible. It is a countdown, not a score: at `0` the box is back at its full declared weight, with no ramp and nothing carried over from the demotion.
+- **`in_flight`** — requests this candidate has outstanding right now, counted from the moment it is chosen (by the router or by an `x-session-affinity` pin) until its response ends, errors, or is dropped mid-flight, so the wait it covers includes connecting, uploading, TTFB and the stream itself. It is one count per box, so a candidate listed under several aliases shows the same number in every entry, and `0` means nothing is in flight.
+- **`busy`** — `true` while a prompt is running on this candidate, i.e. `in_flight > 0`. It is the word the placement rule uses: a new session is placed on an idle candidate in preference to a busy one whatever their weights, and when every candidate of the alias is busy the least busy of them takes the session, with weight as the tiebreak. A turn of a session that is already pinned is not moved by busyness — it queues behind the running prompt on its own box.
+- **`routing`** — the whole allocation policy, as declared: `weight` is the integer the config gave this candidate in this alias, and `share` is that weight over the alias's total weight. Nothing measured scales it. The `local` row above is the point of the design: it has a 76% error-rate EWMA, and its declared share is exactly what its weight says, because a share is not something the router discovers. Note what the two fields say about a demoted box: `share` is the share its weight buys it *when it is eligible*, and `demotion_secs_left` is why it is taking nothing right now — the demotion is a window on a clock, not a discount applied to the declared number.
 - **`observed`** — what the box has been measured doing: the streaming TTFC and non-streaming response-time EWMAs (`null` while cold in that mode) and the error-rate EWMA, under a `note` saying they are not used for routing. Seeing a box that has quietly gotten slow is, in this design, a human reading a number and changing a `weight`.
 - **Weights are per alias.** A candidate reachable through several aliases appears once per alias, because its share is relative to whoever it competes with there.
 - The numbers come from the same placement schedule the picker draws from, so `/status` and the routing decision cannot drift apart, and rendering them consumes no pick. They describe what the router would do *now*: a request riding an `x-session-affinity` pin bypasses the placement path entirely and follows none of it.
@@ -286,11 +307,13 @@ Each request gets a span with a `request_id`; a client-supplied W3C `traceparent
 
 A caller that hangs up mid-request (closing the write half or the whole connection) is normal traffic, not a fault: it is logged at `debug` with the caller's address and counted in `sturnus_client_disconnects_total`, while genuine connection faults (such as a failed response write) stay at `error`.
 
-At `debug` each routed request also logs the decision behind its `INFO routing request` line: the alias, the candidate that won, why it won, and every candidate's declared share of the alias — the same numbers `/status` reports:
+At `debug` each routed request also logs the decision behind its `INFO routing request` line: the alias, the candidate that won, why it won, every candidate's declared share of the alias, and the boxes the placement skipped because they are demoted, with the seconds left on each window — the same numbers `/status` reports:
 
 ```text
-DEBUG routing decision alias=fast provider=groq model=llama-3.3-70b mode="nonstreaming" reason="fresh-by-weight" shares=groq/llama-3.3-70b=60.0% openai/gpt-4o-mini=20.0% local/qwen3-32b=20.0%
+DEBUG routing decision alias=fast provider=groq model=llama-3.3-70b mode="nonstreaming" reason="fresh-by-weight" shares=groq/llama-3.3-70b=60.0% openai/gpt-4o-mini=20.0% local/qwen3-32b=20.0% demoted=local/qwen3-32b=10s
 ```
+
+`demoted=` is empty when nothing is demoted, so a healthy alias reads exactly as it did. The `reason` is one of `fresh-by-weight` (placed on an idle candidate by weight), `overflow-busy` (every candidate was busy, so the least busy took it), `overflow-demoted` (the alias had nothing eligible, so the heaviest demoted box served the turn), `explicit-pin` (the request rode an `x-session-affinity` pin, and bypassed placement). A transport failure logs its own line at `WARN` naming the window it just started (`demoted_for_secs`), so the demotion and the placement that avoided it are both in the log.
 
 ## Session affinity
 
@@ -310,7 +333,7 @@ response = client.chat.completions.create(
 )
 ```
 
-Fully stateless — works across pods with no shared state. The pin is honored until the pinned candidate's error-rate EWMA breaches `error_threshold` (at the default smoothing, roughly two consecutive errors), at which point the header is ignored and a new provider is selected — check the updated `x-session-affinity` in the response. Unknown or malformed headers fall back to normal routing.
+Fully stateless — works across pods with no shared state. The pin is honored whatever the pinned box's error rate: an explicit `provider/model` pin is the operator or the caller naming that box, so a transport failure against it is reported, not routed around, and a demoted box keeps serving the sessions pinned to it. Nothing breaks the header; unknown or malformed headers fall back to normal routing. (The error-rate threshold that used to break pins is gone — see [What config cannot do](#what-config-cannot-do).)
 
 A honored pin bypasses the placement path entirely, and its `debug` line says so — the same `routing decision` line, with `reason="explicit-pin"` and the alias, provider and model — rather than looking like the `reason="fresh-by-weight"` decision a routed request logs.
 
@@ -318,11 +341,14 @@ A honored pin bypasses the placement path entirely, and its `debug` line says so
 
 1. Client sends `POST /v1/chat/completions` with `"model": "fast"`.
 2. Sidecar looks up the `fast` alias and reads each candidate's declared `weight` (an integer, default 1). A candidate's share of the alias is `its weight / sum of weights` — that is the entire allocation policy, and nothing measured — latency, error rate, queue depth — scales it.
-3. A deterministic low-discrepancy sequence (the golden-ratio Weyl sequence) over the alias's pick counter turns those weights into picks: equal weights alternate exactly, a 2:1 pair splits 2:1 over a long run, and there is no RNG to seed, so a split is reproducible in a test and in a debug log.
-4. The `model` field is rewritten to the real model name, auth headers are set, and the request is forwarded.
-5. TTFC is measured at first chunk arrival and fed into the latency EWMA; the response status (any non-2xx counts as an error, including upstream 4xx) feeds the success-rate EWMA. Both are reported on `/status`, and neither feeds the pick.
+3. Eligibility is applied first, as a gate and not a discount: a candidate inside a demotion window is not asked at all, so its share while demoted is exactly zero. No slice of the alias is held aside for it, because nothing probes a demoted box back.
+4. Among the eligible candidates, busyness decides who gets asked and weight decides between them. A candidate with a prompt running is passed over for an idle one whatever its weight; when every candidate is busy the least busy group competes, and weight breaks that tie.
+5. A deterministic low-discrepancy sequence (the golden-ratio Weyl sequence) over the alias's pick counter turns those weights into picks: equal weights alternate exactly, a 2:1 pair splits 2:1 over a long run, and there is no RNG to seed, so a split is reproducible in a test and in a debug log.
+6. When every candidate of the alias is demoted the turn still goes out, on the heaviest demoted box, and the caller gets that box's own response — a dead box's own error is more informative than a `502` the proxy invented.
+7. The `model` field is rewritten to the real model name, auth headers are set, and the request is forwarded.
+8. TTFC is measured at first chunk arrival and fed into the latency EWMA; the response status (any non-2xx counts as an error, including upstream 4xx) feeds the success-rate EWMA. Both are reported on `/status`, and neither feeds the pick. A request that never got a response at all — connect, DNS, TLS, connect timeout, read timeout — starts the box's demotion window instead.
 
-The share is written, not discovered: the 95% box is `weight = 19` beside `weight = 1`. The trade is explicit — the router does not notice on its own that a box has gotten slow or started erroring, because it is not looking. `/status` reports the latency and error-rate EWMAs so an operator can notice, and the fix is a `weight`.
+The share is written, not discovered: the 95% box is `weight = 19` beside `weight = 1`. The trade is explicit — the router does not notice on its own that a box has gotten slow, because it is not looking. `/status` reports the latency EWMA so an operator can notice, and the fix is a `weight`. A box that is *unreachable* is the one exception: that is a box that did not answer, and the router acts on it, by standing it down for a window.
 
 ### The share a weight buys
 
@@ -339,12 +365,27 @@ Every number is `weight / sum(weights)`, and `documented_share_table_matches_the
 
 A candidate that should never serve is left out of the alias's list. `weight = 0` is a startup error naming the alias and the candidate, because the weighted draw has no way to express "never".
 
+### The demotion window
+
+A box that cannot be reached stops taking new placements for `routing.demotion_secs` (default 10) and is fully eligible again when the window ends. That is the whole health model: a timer, not a feedback loop.
+
+- **What starts one:** a request that never got a response from the box — connect refused, DNS failure, TLS failure, connect timeout, read timeout.
+- **What does not:** an upstream `4xx` or `5xx`. A box that answered is a box that is up, so the status is relayed to the caller verbatim and the candidate stays eligible with its full share. A box that returns `500` to everything keeps serving everything, because that is what the operator configured it for; `/status` shows the error-rate EWMA falling, and the fix is a `weight` or removing it from the alias.
+- **What happens during it:** the candidate takes no new placements, and its share is exactly zero — no probe traffic, no reserved slice. A turn of a session explicitly pinned to it is not a new placement, so a pinned caller keeps reaching a demoted box and sees its own failure.
+- **What happens when it ends:** full eligibility at once, at the full declared weight. No ramp, no probe share, no recovery ladder, and no state carried over from the demotion. The first new session placed there is the probe, and it eats the failure if the box is still down.
+- **A second failure** restarts the window rather than stacking it, so a box that fails every 3 seconds under a 10-second window stands down for 10 seconds, not 13.
+- **When the whole alias is demoted**, the heaviest demoted candidate serves the turn and the caller receives that upstream's own response. The proxy does not invent a `502` for a box whose own error would say more.
+
+`routing.demotion_secs = 0` asks for no window at all: every transport failure is relayed and nothing stands down.
+
 ### What config cannot do
 
-The routing keys are `ewma_alpha` (the smoothing of the EWMAs `/status` reports) and `error_threshold` (the error-rate EWMA above which a session-affinity pin is broken), alongside the timeouts and the body-size caps. There is no key for:
+The routing keys are `ewma_alpha` (the smoothing of the EWMAs `/status` reports), `demotion_secs` (the length of a stand-down window), alongside the timeouts and the body-size caps. There is no key for:
 
 - **Making a measured number count.** Latency, error rate and queue depth are recorded and reported, and no weight is scaled by any of them. There is no sharpness knob to turn, and `routing.exploit_k` — the knob this design removed — is a startup error naming `weight` as its replacement, not a key that loads and does nothing.
-- **Disabling or bounding session affinity.** A caller-supplied `x-session-affinity` pin is honored for as long as it stays under `error_threshold` — there is no turn limit, and no setting ignores the header. A handful of long-lived sessions can therefore hold one candidate at 100% of their own traffic however idle it looks to the router.
+- **Grading a box's health on a curve.** `routing.error_threshold` — the error-rate EWMA above which a session-affinity pin was broken — is gone for the same reason: a startup error naming `demotion_secs`. Health is binary on purpose: a box that answered is up, a box that did not is stood down for a window. There is no key for the failure rate that starts a window, no decay curve, no half-life, and no threshold at which a box is "bad enough".
+- **Probing a demoted box back.** There is no probe share, no probe interval, no ramp, and no recovery ladder to configure: the window expires and the box is at full weight, and the first session placed on it is the probe.
+- **Disabling or bounding session affinity.** A caller-supplied `x-session-affinity` pin is honored whatever the pinned box is doing — there is no turn limit, no error rate that breaks it, and no setting that ignores the header. A handful of long-lived sessions can therefore hold one candidate at 100% of their own traffic however idle it looks to the router.
 - **A floor, a ceiling, or a preference a box carries.** Weight is declared per candidate inside one alias's list, so the same box can be `weight = 3` in one alias and `weight = 1` in another; there is no global preference, no floor keeping a broken box sampled, and no ceiling on a healthy one. The list is the policy.
 
 ## Docker

@@ -61,8 +61,60 @@ their history lives in the git log and tags.
   reachable through several aliases reports the same number under each of its
   label sets, because it is one box's queue.
 
+- **A box that cannot be reached stands down for a window.** A request that
+  never got a response from a candidate — connect refused, DNS failure, TLS
+  failure, connect timeout, read timeout — starts a per-candidate demotion
+  window of `routing.demotion_secs` (default 10), and during it the candidate
+  takes no new placements: its share is exactly zero, with no probe traffic and
+  no slice held aside for it. When the window ends the candidate is fully
+  eligible again at its full declared weight, in one step — no ramp, no
+  recovery ladder, nothing carried over from the demotion, because the first
+  new session placed there *is* the probe. A second failure restarts the window
+  rather than stacking it. A box that answers is a box that is up: an upstream
+  `4xx` or `5xx` is relayed to the caller verbatim and starts no window, so a
+  box returning `500` to everything keeps its full share and the fix is a
+  `weight`. When every candidate of an alias is demoted the turn still goes
+  out, on the heaviest demoted one, and the caller receives that upstream's own
+  response — a dead box's own error is more informative than a `502` the proxy
+  invented. `routing.demotion_secs = 0` asks for no window at all. The window
+  is readable where the routing decision is: `/status` reports
+  `demotion_secs_left` per candidate and a `demoted` status, and the `debug`
+  routing line carries `demoted=provider/model=9s` beside the shares, naming the
+  boxes a placement skipped.
+- **A new session is placed on an idle box.** A candidate with a prompt running
+  is passed over for one that is idle whatever their weights — the cheap
+  outcome for a new session is a box that starts it immediately, the expensive
+  one is a queue behind somebody else's prompt — and when every candidate is
+  busy the least busy wins, with weight as the tiebreak. Busyness is a
+  placement rule only: a turn of a session that is already pinned stays on its
+  box and queues behind that box's running prompt. `/status` shows `busy`
+  beside `in_flight`, and the placement reason says which half of the rule ran
+  (`fresh-by-weight` when an idle box existed, `overflow-busy` when none did).
+
 ### Changed
 
+- **Breaking: a session-affinity pin is no longer broken by an error rate, and
+  `routing.error_threshold` is gone.** The threshold was the one place a
+  measured number reached the routing path: a pinned candidate whose
+  error-rate EWMA passed it had its pin dropped. Health is binary now — a box
+  that answered is up, a box that did not is stood down for
+  `routing.demotion_secs` — and an explicit `provider/model` pin is honored
+  whatever the pinned box's error rate, so a config that sets the key fails at
+  startup naming what replaced it:
+
+  ```text
+  routing.error_threshold is no longer used: a transport failure (connect, DNS,
+  TLS, connect timeout, read timeout) demotes a candidate for
+  `routing.demotion_secs` seconds (default 10), an upstream 4xx/5xx is relayed
+  and does not demote, and a pin is honored whatever the pinned box's error
+  rate; remove error_threshold
+  ```
+
+  The migration is to delete the key. A pin that used to break after roughly
+  two consecutive errors now holds, which is the point: the conversation's
+  cache stays warm, and a box that is genuinely unreachable is handled by the
+  demotion window for new placements. The success-rate EWMA is still recorded
+  and shown on `/status`, under `observed`, as observability.
 - **Breaking: an alias's traffic is divided by declared `weight`, not by
   measured latency.** Every candidate of an alias takes an integer `weight`
   (default 1) and its share of that alias is `weight / sum(weights)`; nothing

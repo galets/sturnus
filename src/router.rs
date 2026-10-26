@@ -1,5 +1,5 @@
 use crate::model_map::ResolvedCandidate;
-use crate::tracker::Tracker;
+use crate::tracker::{secs_left, Tracker};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
@@ -63,6 +63,9 @@ pub enum Placement {
     /// Placed on a demoted candidate: either the session's pin was demoted, or
     /// every candidate of the alias is demoted and the highest-weight one
     /// serves so the caller sees the box's own error, not one we invented.
+    ///
+    /// The pin case arrives with the session-key pin; the all-demoted case is
+    /// what a plain placement produces today.
     OverflowDemoted,
 }
 
@@ -211,39 +214,88 @@ pub fn pick_weighted<'a>(
 /// expensive one is a queue behind somebody else's prompt. When every
 /// candidate is busy the least busy wins, and weight breaks that tie.
 ///
+/// Eligibility is applied before either of those: a demoted candidate — one
+/// that failed at the transport level inside its window — is not asked at all,
+/// so it is in the running for neither half of the busyness rule. Its share
+/// while demoted is exactly zero: no slice of the alias is held aside for it,
+/// because nothing probes a demoted box back.
+///
 /// A session that is already pinned does not come through here: its next turn
 /// queues behind the running prompt on its own box (the pin path in
 /// `server.rs`), because re-prefilling a long conversation on a slower box is
 /// the expensive outcome and queueing behind your own prompt is the cheap one.
 ///
-/// The demotion input to eligibility comes in the next ticket; the pool is
-/// every candidate of the alias until then.
+/// When every candidate of the alias is demoted the turn still goes out, on
+/// the heaviest demoted box: a dead box's own error is more informative to the
+/// caller than a `502` the proxy invented, so the proxy keeps out of the way
+/// and relays what comes back.
 pub fn place<'a>(
     candidates: &'a [ResolvedCandidate],
     alias: &str,
     rr: &RoundRobinState,
     tracker: &Tracker,
 ) -> Option<Placed<'a>> {
-    // `min` over an empty candidate list is `None`, so a misconfigured alias
-    // yields no placement and consumes no tick.
-    let least_busy = candidates
+    // Eligibility first: the gate, not a discount. A demoted box is not asked,
+    // whatever its weight buys it.
+    let eligible: Vec<&ResolvedCandidate> = candidates
         .iter()
-        .map(|c| tracker.in_flight(c.stats_index))
-        .min()?;
-    let pool: Vec<&ResolvedCandidate> = candidates
-        .iter()
-        .filter(|c| tracker.in_flight(c.stats_index) == least_busy)
+        .filter(|c| !tracker.is_demoted(c.stats_index))
         .collect();
 
+    // `min` over an empty eligible list is `None`, so an alias with no
+    // candidates yields no placement and consumes no tick.
+    let least_busy = eligible
+        .iter()
+        .map(|c| tracker.in_flight(c.stats_index))
+        .min();
+    if let Some(least_busy) = least_busy {
+        let pool: Vec<&ResolvedCandidate> = eligible
+            .into_iter()
+            .filter(|c| tracker.in_flight(c.stats_index) == least_busy)
+            .collect();
+
+        let candidate = pick_weighted(&pool, alias, rr)?;
+        return Some(Placed {
+            candidate,
+            reason: if least_busy == 0 {
+                Placement::FreshByWeight
+            } else {
+                Placement::OverflowBusy
+            },
+        });
+    }
+
+    // Nothing is eligible. Busyness is a rule for choosing between boxes that
+    // can take a session, so it drops out here, and weight alone names the box
+    // that serves the turn.
+    let top_weight = candidates.iter().map(|c| c.weight).max()?;
+    let pool: Vec<&ResolvedCandidate> = candidates
+        .iter()
+        .filter(|c| tracker.is_demoted(c.stats_index) && c.weight == top_weight)
+        .collect();
     let candidate = pick_weighted(&pool, alias, rr)?;
     Some(Placed {
         candidate,
-        reason: if least_busy == 0 {
-            Placement::FreshByWeight
-        } else {
-            Placement::OverflowBusy
-        },
+        reason: Placement::OverflowDemoted,
     })
+}
+
+/// The demoted candidates of one alias, as the routing debug line wants them:
+/// `beta/m-beta=9s` — the boxes a placement skipped, and how much of each
+/// window is left.
+///
+/// Empty when nothing is demoted, so a placement that skipped nothing logs
+/// exactly what it logged before.
+pub fn demotion_report(candidates: &[ResolvedCandidate], tracker: &Tracker) -> String {
+    candidates
+        .iter()
+        .filter_map(|c| {
+            tracker
+                .demotion_remaining(c.stats_index)
+                .map(|left| format!("{}/{}={}s", c.provider_name, c.model, secs_left(left)))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]

@@ -21,7 +21,7 @@ use crate::metrics::Metrics;
 use crate::model_map::ModelMap;
 use crate::proxy::{self, UpstreamLatency};
 use crate::router::{self, Placed, Placement, RoundRobinState};
-use crate::tracker::{LatencyMode, Tracker};
+use crate::tracker::{self, LatencyMode, Tracker};
 
 pub struct AppState {
     pub model_map: ModelMap,
@@ -241,18 +241,14 @@ pub async fn handle_request(
         .and_then(|value| value.to_str().ok())
         .and_then(|string| string.split_once('/'));
 
-    // A pin is honored until the pinned candidate's error-rate EWMA breaches
-    // `error_threshold`; routing weights never consult the threshold.
+    // An explicit pin is honored whatever the box is doing. Nothing breaks it:
+    // the operator named this box for this session, and a transport failure
+    // against it is reported, not routed around. The pin bypasses placement, so
+    // a demoted box keeps serving the sessions pinned to it.
     let pinned = affinity.and_then(|(provider, model)| {
-        let found = candidates
+        candidates
             .iter()
-            .find(|c| c.provider_name == provider && c.model == model)?;
-        if state.tracker.is_degraded(found.stats_index) {
-            debug!(provider = %provider, model = %model, "affinity candidate above error threshold, re-routing");
-            None
-        } else {
-            Some(found)
-        }
+            .find(|c| c.provider_name == provider && c.model == model)
     });
 
     // Needed before routing: mode selects which EWMA the router compares.
@@ -274,9 +270,12 @@ pub async fn handle_request(
     } else {
         let Some(placed) = router::place(candidates, &alias, &state.rr_state, &state.tracker)
         else {
+            // Reachable only when the alias has no candidate to place at all:
+            // every candidate demoted still serves a turn (see `router::place`),
+            // so this is a config shape, not a box being down.
             return Ok(json_error(
                 hyper::StatusCode::BAD_GATEWAY,
-                &format!("no healthy candidate for model alias '{alias}'"),
+                &format!("no candidate with a non-zero weight for model alias '{alias}'"),
             ));
         };
         placed
@@ -284,8 +283,9 @@ pub async fn handle_request(
 
     // One line per request naming why this box: the reason the placement path
     // produced, beside the declared weights it drew from — the same numbers
-    // `/status` reports. Gated so the schedule is not built for a request the
-    // log level will not show.
+    // `/status` reports — and beside the boxes it skipped because they are
+    // demoted, with the time left on each. Gated so the schedule is not built
+    // for a request the log level will not show.
     if tracing::enabled!(tracing::Level::DEBUG) {
         debug!(
             alias = %alias,
@@ -294,6 +294,7 @@ pub async fn handle_request(
             mode = latency_mode.as_str(),
             reason = placed.reason.as_str(),
             shares = %router::placement_schedule(candidates),
+            demoted = %router::demotion_report(candidates, &state.tracker),
             "routing decision"
         );
     }
@@ -408,11 +409,18 @@ pub async fn handle_request(
             Ok(resp)
         }
         Err(e) => {
+            // The box never answered: connect refused, DNS, TLS, a connect
+            // timeout, a read timeout. That is the one thing a stand-down
+            // window is for, so the candidate is demoted. The caller gets the
+            // `502` the proxy has to write, because there is no upstream
+            // response to relay.
+            let window = state.tracker.demote(stats_index);
             warn!(
                 provider = %provider,
                 model = %model,
                 error = %e,
-                "upstream request failed"
+                demoted_for_secs = window.as_secs(),
+                "upstream request failed, candidate demoted"
             );
 
             state.tracker.record_error(stats_index);
@@ -710,9 +718,10 @@ fn observed_report(state: &AppState, stats_index: usize) -> serde_json::Value {
 }
 
 /// `GET /status`: every candidate as the router currently sees it — its health
-/// (cold/warm/degraded), the declared weight and traffic share it holds in each
-/// alias that can use it, how many requests it is serving right now, and the
-/// latencies and error rate the router measures without routing on. Weights
+/// (cold/warm/demoted) and, when demoted, the seconds left in its window, the
+/// declared weight and traffic share it holds in each alias that can use it,
+/// how many requests it is serving right now, and the latencies and error rate
+/// the router measures without routing on. Weights
 /// come from the same [`router::placement_schedule`] the picker draws from, so
 /// the reported numbers and the routing decision cannot drift apart.
 ///
@@ -743,10 +752,14 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
                 .stats(stats_index)
                 .ewma_ms(LatencyMode::NonStreaming);
             let any_warm = streaming_ewma != u64::MAX || nonstreaming_ewma != u64::MAX;
-            let status = if !any_warm {
+            // Demotion outranks the latency state: "this box takes no new
+            // sessions for 7s" is the actionable fact, and it is the one a
+            // weight change is not the answer to.
+            let demotion_left = state.tracker.demotion_remaining(stats_index);
+            let status = if demotion_left.is_some() {
+                "demoted"
+            } else if !any_warm {
                 "cold"
-            } else if state.tracker.is_degraded(stats_index) {
-                "degraded"
             } else {
                 "warm"
             };
@@ -756,6 +769,10 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
                 "provider": candidate.provider_name,
                 "model": candidate.model,
                 "status": status,
+                // Whole seconds left in the demotion window, `null` when the
+                // candidate is eligible. Rounds up, so a reading never
+                // understates what is left.
+                "demotion_secs_left": demotion_left.map(tracker::secs_left),
                 // Live load, not a schedule number: it is one count per box, so
                 // it sits beside the health fields rather than in `routing`.
                 // `busy` is the word the placement rule uses — a box with a

@@ -82,6 +82,10 @@ code = [
 
 [routing]
 ewma_alpha = 0.3          # EWMA smoothing factor (higher = more reactive)
+demotion_secs = 10        # seconds a box takes no new sessions for after a
+                          # transport failure (connect, DNS, TLS, connect
+                          # timeout, read timeout). An upstream 4xx/5xx is
+                          # relayed and does not demote. 0 asks for no window.
 connect_timeout_secs = 10  # max seconds to establish upstream connection
 read_timeout_secs = 60     # max seconds between chunks before treating upstream as hung
 

@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod body;
+pub mod clock;
 pub mod config;
 pub mod gcp_auth;
 pub mod metrics;

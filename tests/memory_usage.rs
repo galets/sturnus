@@ -101,7 +101,7 @@ fast = [{{ provider = "test", model = "test-model" }}]
     ))
     .unwrap();
 
-    let mut tracker = Tracker::new(0.3, 0.5);
+    let mut tracker = Tracker::new(0.3, 10);
     let model_map = ModelMap::from_config(&config, &mut tracker).unwrap();
     let mut rr_state = RoundRobinState::new();
     for alias in config.model.keys() {

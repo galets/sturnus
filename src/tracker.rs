@@ -2,6 +2,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::clock::Clock;
+
 /// Streaming TTFC and non-streaming response time are tracked separately;
 /// blending them in one EWMA would distort routing for both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,12 +28,19 @@ pub struct CandidateStats {
     /// EWMA of non-streaming response time in milliseconds. u64::MAX = cold.
     nonstreaming_ewma_ms: AtomicU64,
     /// EWMA of request outcomes (success = 1.0, error = 0.0) as f64 bits.
-    /// Starts optimistic at 1.0; recovers via probe traffic, not a clock.
+    /// Starts optimistic at 1.0. Observability only: it is reported on
+    /// `/status`, and it moves no share and breaks no pin. The health signal
+    /// routing acts on is the demotion window, which is a timer.
     success_rate: AtomicU64,
     /// Requests currently outstanding against this candidate, held by
     /// [`InFlightGuard`]. A count of a *candidate*, not of an alias: one box
     /// reachable through several aliases has one queue, not one per alias.
     in_flight: AtomicUsize,
+    /// The instant, on the tracker's clock, until which this candidate is
+    /// demoted. `0` means never: the clock starts at `0`, so a deadline at or
+    /// before the clock's own start has already passed and the candidate is
+    /// eligible.
+    demoted_until_ms: AtomicU64,
 }
 
 impl Default for CandidateStats {
@@ -47,6 +56,7 @@ impl CandidateStats {
             nonstreaming_ewma_ms: AtomicU64::new(u64::MAX),
             success_rate: AtomicU64::new(1.0_f64.to_bits()),
             in_flight: AtomicUsize::new(0),
+            demoted_until_ms: AtomicU64::new(0),
         }
     }
 
@@ -72,6 +82,19 @@ impl CandidateStats {
     /// Requests outstanding against this candidate right now.
     pub fn in_flight(&self) -> usize {
         self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Push the demotion deadline out to `until_ms`, on the tracker's clock.
+    ///
+    /// `fetch_max`, so a failure that lands while a window is already running
+    /// extends it and a late reply to an older failure can never shorten it.
+    fn demote_until(&self, until_ms: u64) {
+        self.demoted_until_ms.fetch_max(until_ms, Ordering::Relaxed);
+    }
+
+    /// The demotion deadline, in clock milliseconds. `0` means never demoted.
+    fn demoted_until_ms(&self) -> u64 {
+        self.demoted_until_ms.load(Ordering::Relaxed)
     }
 
     pub fn record_outcome(&self, success: bool, alpha: f64) {
@@ -111,20 +134,34 @@ impl CandidateStats {
 ///
 /// A slot is an `Arc` so that a request in flight can hold a handle on the
 /// candidate serving it ([`InFlightGuard`]) without borrowing the tracker.
+///
+/// The tracker owns the two things a routing decision reads that are not
+/// declared in the config: the outstanding-turn count (busyness) and the
+/// demotion window (eligibility). The EWMAs it also keeps are observability
+/// only — see [`crate::router::placement_schedule`] for the allocation policy.
 #[derive(Debug)]
 pub struct Tracker {
     stats: Vec<Arc<CandidateStats>>,
     alpha: f64,
-    error_threshold: f64,
+    /// Length of a demotion window, in milliseconds.
+    demotion_ms: u64,
+    clock: Clock,
 }
 
 impl Tracker {
-    pub fn new(alpha: f64, error_threshold: f64) -> Self {
+    pub fn new(alpha: f64, demotion_secs: u64) -> Self {
         Self {
             stats: Vec::new(),
             alpha,
-            error_threshold,
+            demotion_ms: demotion_secs.saturating_mul(1_000),
+            clock: Clock::new(),
         }
+    }
+
+    /// The clock the demotion deadlines are kept on. Its `advance` is the test
+    /// seam for the end of a window; production code reads it only.
+    pub fn clock(&self) -> &Clock {
+        &self.clock
     }
 
     /// Allocates a new stats slot and returns its index. The index is stable
@@ -155,8 +192,8 @@ impl Tracker {
     /// candidate, which is exactly the condition they should have avoided.
     /// There is no retry policy to place the count around — one request is
     /// dispatched to exactly one candidate — and a request that never gets a
-    /// candidate (unknown alias, no healthy candidate, shed with 429) is never
-    /// counted at all.
+    /// candidate (unknown alias, an alias with no candidates, shed with 429)
+    /// is never counted at all.
     ///
     /// The count is returned by [`InFlightGuard::drop`], so releasing it rides
     /// on the response rather than on the code paths that notice one: a
@@ -181,10 +218,39 @@ impl Tracker {
         self.stats[index].record_outcome(false, self.alpha);
     }
 
-    /// Error-rate EWMA above `error_threshold`. Not consulted by routing —
-    /// it only breaks session-affinity pins and labels `/status`.
-    pub fn is_degraded(&self, index: usize) -> bool {
-        1.0 - self.stats[index].success_rate() > self.error_threshold
+    /// Start (or extend) this candidate's demotion window, and return its
+    /// length so the caller can log what it just cost the box.
+    ///
+    /// A transport failure — the request ended with no response from the box —
+    /// is the only thing that calls this. An upstream 4xx/5xx is a box that
+    /// answered, and answering is being up: `server.rs` relays that status and
+    /// records it against the success-rate EWMA without demoting.
+    ///
+    /// The window is a timer, not a feedback loop: nothing probes the box
+    /// during it, no traffic share is reserved for it, and it does not win
+    /// traffic back gradually. When the clock passes the deadline the candidate
+    /// is fully eligible at once, with nothing carried over from the demotion —
+    /// its first new session is its probe, and that session eats the failure if
+    /// the box is still down.
+    pub fn demote(&self, index: usize) -> Duration {
+        let until_ms = self.clock.now_ms().saturating_add(self.demotion_ms);
+        self.stats[index].demote_until(until_ms);
+        Duration::from_millis(self.demotion_ms)
+    }
+
+    /// Whether this candidate is demoted right now: standing to take on no new
+    /// sessions, whatever its weight.
+    pub fn is_demoted(&self, index: usize) -> bool {
+        self.clock.now_ms() < self.stats[index].demoted_until_ms()
+    }
+
+    /// Time left in this candidate's demotion window, or `None` when it is
+    /// eligible. `/status` reports it, so "why is this box getting nothing?"
+    /// is a curl with a number in it.
+    pub fn demotion_remaining(&self, index: usize) -> Option<Duration> {
+        let until_ms = self.stats[index].demoted_until_ms();
+        let now_ms = self.clock.now_ms();
+        (now_ms < until_ms).then(|| Duration::from_millis(until_ms - now_ms))
     }
 }
 
@@ -221,6 +287,14 @@ impl InFlightGuard {
     pub fn in_flight(&self) -> usize {
         self.stats.in_flight()
     }
+}
+
+/// Whole seconds left in a window, rounded up.
+///
+/// `9s` means the window ends within nine seconds, so a reading shown to an
+/// operator never understates what is left.
+pub fn secs_left(remaining: Duration) -> u64 {
+    remaining.as_secs() + u64::from(remaining.subsec_millis() > 0)
 }
 
 impl Drop for InFlightGuard {

@@ -12,6 +12,12 @@
 //! Nothing measured enters that arithmetic. The second test here is the one
 //! that proves it: a candidate that is warmed, then fails fifty times in a
 //! row, keeps exactly the share its weight declares.
+//!
+//! The last section is the demotion window in that same line: the box a
+//! placement skipped and the time left on its window, and the reason a turn
+//! went to a demoted box because the alias had nothing else. The window itself
+//! — a transport failure, zero placements, full weight again at its end — is
+//! `tests/demotion.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -53,7 +59,7 @@ fn state_from_config(config_toml: &str) -> Arc<AppState> {
     sturnus::init_crypto();
     let config: sturnus::config::Config = toml::from_str(config_toml).unwrap();
 
-    let mut tracker = Tracker::new(0.3, 0.5);
+    let mut tracker = Tracker::new(0.3, 10);
     let model_map = ModelMap::from_config(&config, &mut tracker).unwrap();
     let mut rr_state = RoundRobinState::new();
     for alias in config.model.keys() {
@@ -320,6 +326,12 @@ async fn routed_request_logs_the_reason_and_the_declared_shares() {
             line.contains("beta/m-beta=33.3%"),
             "beta's declared share missing: {line}"
         );
+        // Nothing is demoted, so the skip report is empty: a line that names no
+        // skipped box reads exactly as it did before demotion existed.
+        assert!(
+            line.ends_with("demoted="),
+            "an unskipped placement should report no demoted box: {line}"
+        );
     })
     .await;
 
@@ -376,6 +388,193 @@ async fn an_explicit_pin_logs_the_pin_as_its_reason() {
         assert!(
             !line.contains(r#"reason="fresh-by-weight""#),
             "a pin is not a weighted placement:\n{text}"
+        );
+    })
+    .await;
+
+    for upstream in upstreams {
+        upstream.abort();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The demotion window, in the same line: which boxes a placement skipped, and
+// how much of each window is left.
+// ---------------------------------------------------------------------------
+
+/// Start a demotion window on `provider`, as a transport failure would.
+fn demote(state: &AppState, provider: &str) {
+    let candidate = state
+        .model_map
+        .get("fast")
+        .unwrap()
+        .iter()
+        .find(|c| c.provider_name == provider)
+        .unwrap();
+    state.tracker.demote(candidate.stats_index);
+}
+
+/// The routing debug line names the box a placement skipped, with the time
+/// left on its window, so "why is this box getting nothing?" is answerable
+/// from the log alone.
+#[tokio::test(flavor = "current_thread")]
+async fn the_routing_debug_line_names_the_demoted_box_a_placement_skipped() {
+    let logs = CapturedLogs::default();
+    let (state, upstreams) = two_candidate_state().await;
+    demote(&state, "alpha");
+    let (addr, _shutdown) = start_server(state).await;
+
+    capture_logs(logs.clone(), async move {
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&serde_json::json!({"model": "fast", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("x-sturnus-provider")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "beta",
+            "the weight-2 box is demoted, so the weight-1 box takes the turn"
+        );
+
+        let text = wait_for_log(&logs, Duration::from_secs(3), |t| {
+            t.contains("routing decision")
+        })
+        .await;
+        let line = text
+            .lines()
+            .find(|line| line.contains("routing decision"))
+            .unwrap_or_else(|| panic!("no routing decision line in:\n{text}"));
+
+        assert!(
+            line.contains("provider=beta"),
+            "the box that served is named: {line}"
+        );
+        // The skipped box, and the seconds left on its window.
+        assert!(
+            line.contains("alpha/m-alpha=10s"),
+            "the skipped, demoted box should be named with its window: {line}"
+        );
+        assert!(
+            !line.contains("beta/m-beta=10s"),
+            "the box that served was not skipped: {line}"
+        );
+    })
+    .await;
+
+    for upstream in upstreams {
+        upstream.abort();
+    }
+}
+
+/// When every candidate is demoted the turn still goes out, on the heaviest
+/// demoted box, and the line says so: `overflow-demoted` is a placement reason
+/// an operator can grep for, distinct from the busy overflow and from a
+/// weighted choice.
+#[tokio::test(flavor = "current_thread")]
+async fn a_placement_onto_the_heaviest_demoted_box_logs_that_reason() {
+    let logs = CapturedLogs::default();
+    let (state, upstreams) = two_candidate_state().await;
+    demote(&state, "alpha");
+    demote(&state, "beta");
+    let (addr, _shutdown) = start_server(state).await;
+
+    capture_logs(logs.clone(), async move {
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&serde_json::json!({"model": "fast", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "a demoted box still answers its own turns"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-sturnus-provider")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "alpha",
+            "the heaviest demoted box serves"
+        );
+
+        let text = wait_for_log(&logs, Duration::from_secs(3), |t| {
+            t.contains(r#"reason="overflow-demoted""#)
+        })
+        .await;
+        let line = text
+            .lines()
+            .find(|line| line.contains(r#"reason="overflow-demoted""#))
+            .unwrap_or_else(|| panic!("no overflow-demoted line in:\n{text}"));
+        assert!(
+            line.contains("provider=alpha"),
+            "the box that served is named: {line}"
+        );
+        // Both windows are on the line, so the reader can see there was no
+        // eligible box to skip to.
+        assert!(
+            line.contains("alpha/m-alpha=10s") && line.contains("beta/m-beta=10s"),
+            "every demoted box should be named: {line}"
+        );
+    })
+    .await;
+
+    for upstream in upstreams {
+        upstream.abort();
+    }
+}
+
+/// A demotion is not a pin-breaker, and the line says which box a pinned turn
+/// rode while that box sat out the placement path.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pinned_turn_on_a_demoted_box_logs_the_pin_and_the_window_it_skipped() {
+    let logs = CapturedLogs::default();
+    let (state, upstreams) = two_candidate_state().await;
+    demote(&state, "beta");
+    let (addr, _shutdown) = start_server(state).await;
+
+    capture_logs(logs.clone(), async move {
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("x-session-affinity", "beta/m-beta")
+            .json(&serde_json::json!({"model": "fast", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("x-sturnus-provider")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "beta",
+            "the pin is honored while beta is demoted"
+        );
+
+        let text = wait_for_log(&logs, Duration::from_secs(3), |t| {
+            t.contains(r#"reason="explicit-pin""#)
+        })
+        .await;
+        let line = text
+            .lines()
+            .find(|line| line.contains(r#"reason="explicit-pin""#))
+            .unwrap_or_else(|| panic!("no explicit-pin line in:\n{text}"));
+        assert!(
+            line.contains("provider=beta"),
+            "the pinned box is named: {line}"
+        );
+        assert!(
+            line.contains("beta/m-beta=10s"),
+            "the window the placement path would have skipped is on the line: {line}"
         );
     })
     .await;

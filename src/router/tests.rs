@@ -2,6 +2,7 @@ use super::*;
 use crate::model_map::ProviderKind;
 use crate::tracker::{InFlightGuard, Tracker};
 use hyper::header::HeaderValue;
+use std::time::Duration;
 
 fn make_candidate(
     provider: &str,
@@ -26,7 +27,16 @@ fn make_candidate(
 
 /// Candidates in config order, each with its own stats slot, all idle.
 fn setup(specs: &[(&str, usize)]) -> (Vec<ResolvedCandidate>, Tracker, RoundRobinState) {
-    let mut tracker = Tracker::new(0.3, 0.5);
+    setup_window(specs, 10)
+}
+
+/// The same, with a chosen demotion window, so a test can ask for a
+/// zero-length one.
+fn setup_window(
+    specs: &[(&str, usize)],
+    demotion_secs: u64,
+) -> (Vec<ResolvedCandidate>, Tracker, RoundRobinState) {
+    let mut tracker = Tracker::new(0.3, demotion_secs);
     let mut rr = RoundRobinState::new();
     rr.register_alias("test".to_string());
     let candidates: Vec<_> = specs
@@ -333,4 +343,201 @@ fn a_box_holding_one_more_turn_than_the_rest_is_not_the_least_busy() {
             "idle"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Eligibility: a demoted candidate takes no new sessions for its window. The
+// window is a timer, so the tests move the tracker's clock rather than
+// sleeping, and the share assertions are exact — a demoted box's share is
+// zero, not small.
+// ---------------------------------------------------------------------------
+
+/// Put `candidate` in a demotion window, for as long as the tracker's clock
+/// has not advanced past it.
+fn demote(tracker: &Tracker, candidate: &ResolvedCandidate) {
+    tracker.demote(candidate.stats_index);
+}
+
+#[test]
+fn a_demoted_box_takes_no_placements_for_its_window() {
+    // The weight-19 box is demoted. Its share during the window is not
+    // reduced, it is zero: 1000 picks and not one of them lands on it.
+    let (candidates, tracker, rr) = setup(&[("fast", 19), ("slow", 1)]);
+    demote(&tracker, &candidates[0]);
+
+    let counts = tally(&candidates, &tracker, &rr, 1000);
+    assert_eq!(
+        counts[0], 0,
+        "a demoted candidate takes no new placements: {counts:?}"
+    );
+    assert_eq!(counts[1], 1000, "its share goes to the eligible box");
+}
+
+#[test]
+fn a_demoted_box_loses_to_a_box_at_a_nineteenth_the_weight() {
+    // Eligibility is a gate, not a discount: the box at weight 1 serves every
+    // pick while the weight-19 box is demoted.
+    let (candidates, tracker, rr) = setup(&[("fast", 19), ("slow", 1)]);
+    demote(&tracker, &candidates[1]);
+
+    for _ in 0..5 {
+        let placed = place(&candidates, "test", &rr, &tracker).unwrap();
+        assert_eq!(placed.candidate.provider_name, "fast");
+        // An eligible box exists, so this is the ordinary case, not an overflow.
+        assert_eq!(placed.reason, Placement::FreshByWeight);
+    }
+}
+
+#[test]
+fn a_demoted_light_box_keeps_no_probe_share() {
+    // The point of "nothing probes it back": no slice of the alias is held
+    // aside for the demoted box so its recovery can be noticed. Over 2000
+    // picks the weight-1 demoted box gets exactly nothing, and the healthy
+    // box gets all of it — not 19/20 of it.
+    let (candidates, tracker, rr) = setup(&[("fast", 19), ("slow", 1)]);
+    demote(&tracker, &candidates[1]);
+
+    let counts = tally(&candidates, &tracker, &rr, 2000);
+    assert_eq!(counts[1], 0, "no probe share is reserved: {counts:?}");
+    assert_eq!(counts[0], 2000, "the eligible box takes the whole alias");
+}
+
+#[test]
+fn a_demoted_box_is_fully_eligible_the_moment_its_window_ends() {
+    // One window, one step back: zero placements right up to the deadline, the
+    // full declared weight the instant it passes. No ramp, no probe traffic,
+    // no recovery ladder — and nothing carried over from the demotion.
+    let (candidates, tracker, rr) = setup(&[("fast", 19), ("slow", 1)]);
+    demote(&tracker, &candidates[0]);
+
+    assert_eq!(tally(&candidates, &tracker, &rr, 200), [0, 200]);
+
+    tracker.clock().advance(Duration::from_secs(10));
+
+    let counts = tally(&candidates, &tracker, &rr, 1000);
+    let fast_share = counts[0] as f64 / 1000.0;
+    assert!(
+        (fast_share - 0.95).abs() < 0.02,
+        "expected the full declared weight the moment the window ended, got {counts:?}"
+    );
+}
+
+#[test]
+fn a_window_that_has_not_expired_yet_is_not_a_ramp() {
+    // The other side of the same rule: 9.999s in, the box is still at zero.
+    // There is no partial eligibility to observe on the way to the deadline.
+    let (candidates, tracker, rr) = setup(&[("fast", 19), ("slow", 1)]);
+    demote(&tracker, &candidates[0]);
+
+    tracker.clock().advance(Duration::from_millis(9_999));
+
+    assert_eq!(tally(&candidates, &tracker, &rr, 200), [0, 200]);
+}
+
+#[test]
+fn when_every_candidate_is_demoted_the_highest_weight_one_serves() {
+    // Every box is down. The turn still goes somewhere: the heaviest demoted
+    // box serves it so the caller sees that box's own answer rather than a
+    // 502 the proxy invented.
+    let (candidates, tracker, rr) = setup(&[("heavy", 5), ("light", 1)]);
+    demote(&tracker, &candidates[0]);
+    demote(&tracker, &candidates[1]);
+
+    for _ in 0..4 {
+        let placed = place(&candidates, "test", &rr, &tracker).unwrap();
+        assert_eq!(
+            placed.candidate.provider_name, "heavy",
+            "the highest-weight demoted candidate serves the turn"
+        );
+        assert_eq!(placed.reason, Placement::OverflowDemoted);
+    }
+}
+
+#[test]
+fn the_all_demoted_fallback_ignores_busyness() {
+    // Every box is demoted, so queueing behind one is not the thing being
+    // weighed: the caller needs the box's own answer, and the heaviest box is
+    // the one the alias is mostly made of. Busyness is a rule for choosing
+    // between boxes that can take a session.
+    let (candidates, tracker, rr) = setup(&[("heavy", 19), ("light", 1)]);
+    let _guards = busy(&tracker, &candidates[0], 2);
+    demote(&tracker, &candidates[0]);
+    demote(&tracker, &candidates[1]);
+
+    for _ in 0..3 {
+        let placed = place(&candidates, "test", &rr, &tracker).unwrap();
+        assert_eq!(placed.candidate.provider_name, "heavy");
+        assert_eq!(placed.reason, Placement::OverflowDemoted);
+    }
+}
+
+#[test]
+fn equal_weight_demoted_boxes_take_turns_in_the_all_demoted_case() {
+    // No RNG, same as every other placement: two equally heavy demoted boxes
+    // alternate over the alias's ticks.
+    let (candidates, tracker, rr) = setup(&[("a", 1), ("b", 1)]);
+    demote(&tracker, &candidates[0]);
+    demote(&tracker, &candidates[1]);
+
+    let picks: Vec<&str> = (0..4)
+        .map(|_| {
+            place(&candidates, "test", &rr, &tracker)
+                .unwrap()
+                .candidate
+                .provider_name
+                .as_str()
+        })
+        .collect();
+    assert_eq!(picks, vec!["a", "b", "a", "b"]);
+}
+
+#[test]
+fn a_demoted_idle_box_does_not_make_a_busy_eligible_box_lose() {
+    // Eligibility is applied before busyness: the idle box is demoted, so the
+    // only box that can be asked is the busy one, and it is asked.
+    let (candidates, tracker, rr) = setup(&[("demoted", 19), ("busy", 1)]);
+    demote(&tracker, &candidates[0]);
+    let _guards = busy(&tracker, &candidates[1], 1);
+
+    for _ in 0..3 {
+        let placed = place(&candidates, "test", &rr, &tracker).unwrap();
+        assert_eq!(placed.candidate.provider_name, "busy");
+        assert_eq!(placed.reason, Placement::OverflowBusy);
+    }
+}
+
+#[test]
+fn demotion_report_names_the_boxes_a_placement_skipped() {
+    // The debug line's `demoted=` field: the boxes that were passed over, and
+    // how much of their window is left. Whole seconds, rounded up.
+    let (candidates, tracker, _rr) = setup(&[("a", 1), ("b", 1)]);
+    assert_eq!(
+        demotion_report(&candidates, &tracker),
+        "",
+        "a placement that skipped nothing says nothing"
+    );
+
+    demote(&tracker, &candidates[1]);
+    assert_eq!(demotion_report(&candidates, &tracker), "b/m=10s");
+
+    tracker.clock().advance(Duration::from_secs(1));
+    assert_eq!(demotion_report(&candidates, &tracker), "b/m=9s");
+}
+
+#[test]
+fn a_zero_length_window_leaves_the_alias_untouched() {
+    // `routing.demotion_secs = 0` asks for no demotion at all, and gets it:
+    // every window has ended before the next placement is asked, so the
+    // declared split stands.
+    let (candidates, tracker, rr) = setup_window(&[("fast", 19), ("slow", 1)], 0);
+    for candidate in &candidates {
+        tracker.demote(candidate.stats_index);
+    }
+
+    let counts = tally(&candidates, &tracker, &rr, 1000);
+    let fast_share = counts[0] as f64 / 1000.0;
+    assert!(
+        (fast_share - 0.95).abs() < 0.02,
+        "a zero window demotes nobody, so the declared split stands: {counts:?}"
+    );
 }
