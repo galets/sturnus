@@ -212,6 +212,54 @@ demotion_secs = 45
     assert!(config.validate().is_ok());
 }
 
+/// The session table's two bounds default to the numbers the README,
+/// `config.example.toml` and `/status` all carry. What the numbers are *for* is
+/// argued in [`crate::session`], against what an upstream prompt cache
+/// actually retains.
+#[test]
+fn the_session_table_defaults_to_the_documented_bounds() {
+    let toml_str = r#"
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini" }]
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.routing.session_ttl_secs, 1800);
+    assert_eq!(config.routing.session_table_limit, 1024);
+    assert_eq!(
+        config.routing.session_ttl_secs,
+        crate::session::DEFAULT_IDLE_TTL_SECS
+    );
+    assert_eq!(
+        config.routing.session_table_limit,
+        crate::session::DEFAULT_TABLE_LIMIT
+    );
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn an_explicit_session_table_bound_is_parsed() {
+    let toml_str = r#"
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini" }]
+
+[routing]
+session_ttl_secs = 45
+session_table_limit = 16
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.routing.session_ttl_secs, 45);
+    assert_eq!(config.routing.session_table_limit, 16);
+    assert!(config.validate().is_ok());
+}
+
 #[test]
 fn a_candidate_weight_defaults_to_one() {
     let toml_str = r#"

@@ -2,7 +2,7 @@ use clap::Parser;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
@@ -11,6 +11,7 @@ use sturnus::metrics::Metrics;
 use sturnus::model_map::{ModelMap, ProviderKind};
 use sturnus::router::RoundRobinState;
 use sturnus::server::{AppState, BufferBudget};
+use sturnus::session::SessionTable;
 use sturnus::tracker::Tracker;
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -212,12 +213,27 @@ async fn main() -> anyhow::Result<()> {
         .collect();
     metrics.init_zero(&label_triples);
 
+    // Session pins live in this process's memory and nowhere else, so a
+    // deployment with several replicas behind a load balancer has several
+    // independent tables: one session's turns land on whichever replica
+    // received them, and each replica places them for itself. Logged so the
+    // bound an operator is reading is the one this instance enforces.
+    info!(
+        pinned_max = config.routing.session_table_limit,
+        idle_ttl_secs = config.routing.session_ttl_secs,
+        "session pins are per instance; each replica places its own sessions"
+    );
+
     let shutdown_timeout = std::time::Duration::from_secs(config.routing.shutdown_timeout_secs);
 
     let state = Arc::new(AppState {
         model_map,
         tracker,
         rr_state,
+        sessions: Mutex::new(SessionTable::new(
+            config.routing.session_table_limit,
+            config.routing.session_ttl_secs,
+        )),
         client,
         gcp_token_provider,
         budget,

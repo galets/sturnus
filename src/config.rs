@@ -222,6 +222,19 @@ pub struct RoutingConfig {
     /// is a box that answered, so it relays and does not demote. `0` asks for
     /// no window at all.
     pub demotion_secs: u64,
+    /// How long a session pin survives without a turn. The table is per
+    /// instance, so this is how long one instance remembers a conversation;
+    /// past it the session places fresh. The default outlives every
+    /// automatic upstream prompt-cache retention — see
+    /// [`crate::session::DEFAULT_IDLE_TTL_SECS`] for what that means and why
+    /// the pin is kept that long anyway. `0` gives a pin no quiet to survive,
+    /// so every turn places fresh.
+    pub session_ttl_secs: u64,
+    /// How many sessions one instance pins at most, least recently used
+    /// evicted first. This is the bound on a table whose keys are caller
+    /// input, so it is a memory bound, not a routing knob — see
+    /// [`crate::session::DEFAULT_TABLE_LIMIT`]. `0` pins nothing.
+    pub session_table_limit: usize,
     pub connect_timeout_secs: u64,
     pub read_timeout_secs: u64,
     /// Maximum request body size in bytes; larger requests 413.
@@ -243,6 +256,8 @@ impl Default for RoutingConfig {
             exploit_k: None,
             error_threshold: None,
             demotion_secs: 10,
+            session_ttl_secs: crate::session::DEFAULT_IDLE_TTL_SECS,
+            session_table_limit: crate::session::DEFAULT_TABLE_LIMIT,
             connect_timeout_secs: 10,
             read_timeout_secs: 60,
             max_body_bytes: 32 * 1024 * 1024, // 32 MB

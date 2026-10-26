@@ -89,6 +89,19 @@ demotion_secs = 10        # seconds a box takes no new sessions for after a
 connect_timeout_secs = 10  # max seconds to establish upstream connection
 read_timeout_secs = 60     # max seconds between chunks before treating upstream as hung
 
+# Session pins: how long an `x-session-affinity` session key keeps its box.
+# A session key's first turn is placed by weight; every later turn rides the
+# pin, busy or not. A `provider/model` value in the same header is an explicit
+# pin and never enters this table. Both bounds are a cost, not a safety
+# margin: a session that crosses one places fresh, which is the cache miss
+# affinity was bought to avoid. The TTL is a conversation-lifetime bound, not
+# a cache-retention match — real prompt caches (5-10 min at one provider, 5
+# min and 1 h tiers at another, memory-pressure eviction on self-hosted
+# boxes) are shorter than this and no single number can track them. The limit
+# is a memory bound on keys this process does not control.
+session_ttl_secs = 1800     # seconds quiet before a session's pin is dropped
+session_table_limit = 1024  # sessions held; the least recently used goes first
+
 # The share a weight buys, for an alias of two candidates:
 #
 #   weights      preferred box   other box

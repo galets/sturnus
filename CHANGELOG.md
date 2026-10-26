@@ -90,6 +90,31 @@ their history lives in the git log and tags.
   box and queues behind that box's running prompt. `/status` shows `busy`
   beside `in_flight`, and the placement reason says which half of the rule ran
   (`fresh-by-weight` when an idle box existed, `overflow-busy` when none did).
+- **A session key pins a conversation to one box.** `x-session-affinity` names
+  two different things, and the router reads it as the shape it finds. A value
+  containing a slash is a `provider/model` **pin**: it names a box outright, it
+  is routed like any other request, and it is stateless — the header carries the
+  whole decision, so it works across replicas with nothing shared. Any other
+  usable value is a **session key**: a conversation id from the caller, which is
+  not routed at all. Its first turn is placed by the normal rules, and every
+  later turn of that session rides to the same box, busy or not — the box that
+  has already paid for the prompt is the box worth queuing behind. A key with no
+  live pin — new, quiet past `routing.session_ttl_secs` (default 1800), evicted
+  at `routing.session_table_limit` (default 1024, least recently used first), or
+  pinned to a box that has since been demoted — places fresh, and the box it
+  lands on becomes the pin. A demotion therefore
+  **re-pins**: the session follows its new box, and nothing moves it back when
+  the old box's window expires. Pins are keyed per alias, because two aliases may
+  name two models and a box that cached one prompt has not cached the other.
+  Nothing is ever refused for a header the router cannot use: an empty value, a
+  leading or trailing slash, a model that is not a candidate of this alias, and
+  an absent header all place normally. The table is in-process memory, so a
+  session is pinned per instance — behind two replicas each places the session
+  on its own first turn, and the pin only holds once traffic is sticky above
+  them; the startup log says so. `/status` reports the table (`sessions_pinned`
+  per candidate, and `sessions` with `pinned`, `limit`, `idle_ttl_secs`), and
+  the `debug` routing line carries `session=` beside the box, with
+  `reason="pinned"` on the turns that rode a pin.
 
 ### Changed
 

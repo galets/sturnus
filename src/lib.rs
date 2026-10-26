@@ -10,6 +10,7 @@ pub mod model_map;
 pub mod proxy;
 pub mod router;
 pub mod server;
+pub mod session;
 pub mod trace;
 pub mod tracker;
 

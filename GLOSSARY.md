@@ -21,10 +21,23 @@ is a new session. A subagent's conversation is a separate session.
 
 **Pin** — the binding of one session to one candidate for the session's
 lifetime, so that the conversation's cache stays warm. A pin is a session's
-claim on a candidate, not a request's.
+claim on a candidate, not a request's. Two things make one: a **session key**
+whose first turn is placed and then bound, and an **explicit pin**, where the
+caller names the box outright. A pin is bounded — a session quiet past the idle
+TTL, or evicted at the table's cap, places fresh — and it lives in one instance,
+so replicas place their own sessions.
 
-**Fresh pick** — a new session choosing a candidate by weight, independently of
-any session it descends from.
+**Session key** — the identity a caller gives a conversation, by which a pin is
+found again. A new chat window is a new key, so it is a fresh pick. Pins are
+keyed per alias, so the same session inside a second alias places fresh there.
+
+**Explicit pin** — a caller naming one `provider/model` outright. It is checked
+before the session table and honored whatever that box is doing, including a
+box that is demoted: it is a request's instruction, not a session's claim, so it
+neither creates a pin nor is moved by one.
+
+**Fresh pick** — a new session choosing a candidate by weight and busyness,
+independently of any session it descends from.
 
 **Placement** — the choice of candidate for a new session. Weight is the
 preference; a candidate with a prompt running is passed over for one that is

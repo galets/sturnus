@@ -21,7 +21,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::StreamExt as _;
@@ -33,6 +33,7 @@ use sturnus::metrics::Metrics;
 use sturnus::model_map::ModelMap;
 use sturnus::router::RoundRobinState;
 use sturnus::server::{run_server, AppState, BufferBudget};
+use sturnus::session::SessionTable;
 use sturnus::tracker::Tracker;
 
 mod common;
@@ -95,6 +96,7 @@ fn state_for(config_toml: &str, client: reqwest::Client) -> Arc<AppState> {
         model_map,
         tracker,
         rr_state,
+        sessions: Mutex::new(SessionTable::default()),
         client,
         gcp_token_provider: None,
         budget: BufferBudget::new(128 * 1024 * 1024, 32 * 1024 * 1024),

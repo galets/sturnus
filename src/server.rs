@@ -10,7 +10,7 @@ use hyper_util::server::graceful::GracefulShutdown;
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn, Instrument};
@@ -18,15 +18,20 @@ use tracing::{debug, error, info, warn, Instrument};
 use crate::auth::ApiKeys;
 use crate::gcp_auth::GcpTokenProvider;
 use crate::metrics::Metrics;
-use crate::model_map::ModelMap;
+use crate::model_map::{ModelMap, ResolvedCandidate};
 use crate::proxy::{self, UpstreamLatency};
 use crate::router::{self, Placed, Placement, RoundRobinState};
+use crate::session::{self, SessionTable};
 use crate::tracker::{self, LatencyMode, Tracker};
 
 pub struct AppState {
     pub model_map: ModelMap,
     pub tracker: Tracker,
     pub rr_state: RoundRobinState,
+    /// The sessions this instance has pinned to a candidate. Per instance and
+    /// in-memory: several replicas behind a load balancer each place their own
+    /// sessions, and nothing is shared between them.
+    pub sessions: Mutex<SessionTable>,
     pub client: reqwest::Client,
     pub gcp_token_provider: Option<GcpTokenProvider>,
     pub budget: BufferBudget,
@@ -35,6 +40,42 @@ pub struct AppState {
     /// When set, every proxied request must present one of these keys.
     /// Observability routes stay open so probes and scrapes need no secrets.
     pub api_keys: Option<ApiKeys>,
+}
+
+impl AppState {
+    /// The candidate this session is pinned to, touching the entry so it stays
+    /// alive.
+    ///
+    /// `None` means the turn is placed: no pin, an expired pin, an evicted one,
+    /// or a pin whose box is demoted. The demoted case is the one that matters
+    /// for the model: busyness never moves a pinned turn (it queues behind its
+    /// own prompt), but a box that is standing down takes no *new* sessions,
+    /// and a session overflowed off it is a new session to that box. The
+    /// placement that follows re-pins, and nothing remembers the box it left.
+    fn pinned_candidate<'a>(
+        &self,
+        alias: &str,
+        key: &str,
+        candidates: &'a [ResolvedCandidate],
+    ) -> Option<&'a ResolvedCandidate> {
+        let now_ms = self.tracker.clock().now_ms();
+        let index = self.sessions.lock().ok()?.lookup(alias, key, now_ms)?;
+        candidates
+            .iter()
+            .find(|candidate| candidate.stats_index == index && !self.tracker.is_demoted(index))
+    }
+
+    /// Record that this session's turns belong to the candidate at
+    /// `stats_index`, replacing whatever it was pinned to.
+    fn pin_session(&self, alias: &str, key: &str, stats_index: usize) {
+        let now_ms = self.tracker.clock().now_ms();
+        // A poisoned table means a request panicked while holding it; dropping
+        // the pin costs a session its affinity, which is what an absent pin
+        // already means, so the lock is not worth a panic of its own.
+        if let Ok(mut table) = self.sessions.lock() {
+            table.pin(alias, key, stats_index, now_ms);
+        }
+    }
 }
 
 /// Caps how much memory all in-flight requests may spend buffering bodies,
@@ -236,20 +277,15 @@ pub async fn handle_request(
         ));
     };
 
-    let affinity: Option<(&str, &str)> = affinity_header
-        .as_ref()
-        .and_then(|value| value.to_str().ok())
-        .and_then(|string| string.split_once('/'));
-
-    // An explicit pin is honored whatever the box is doing. Nothing breaks it:
-    // the operator named this box for this session, and a transport failure
-    // against it is reported, not routed around. The pin bypasses placement, so
-    // a demoted box keeps serving the sessions pinned to it.
-    let pinned = affinity.and_then(|(provider, model)| {
-        candidates
-            .iter()
-            .find(|c| c.provider_name == provider && c.model == model)
-    });
+    // The header's shape says what it asks for: a `provider/model` value names
+    // one box outright, anything else is a session key. An absent,
+    // unprintable, blank or over-long value is no instruction at all, and the
+    // turn is placed.
+    let affinity = session::classify(affinity_header.as_ref());
+    let session_key = match affinity {
+        Some(session::Affinity::SessionKey(key)) => Some(key),
+        _ => None,
+    };
 
     // Needed before routing: mode selects which EWMA the router compares.
     let is_streaming = body.get_as::<bool>("stream").unwrap_or(false);
@@ -259,26 +295,41 @@ pub async fn handle_request(
         LatencyMode::NonStreaming
     };
 
-    let placed = if let Some(c) = pinned {
-        // An explicit pin bypasses the placement path entirely, so log it as a
-        // pin: at debug a pinned request must not read like a weighted
-        // decision it never made.
-        Placed {
-            candidate: c,
-            reason: Placement::ExplicitPin,
-        }
-    } else {
-        let Some(placed) = router::place(candidates, &alias, &state.rr_state, &state.tracker)
-        else {
-            // Reachable only when the alias has no candidate to place at all:
-            // every candidate demoted still serves a turn (see `router::place`),
-            // so this is a config shape, not a box being down.
-            return Ok(json_error(
-                hyper::StatusCode::BAD_GATEWAY,
-                &format!("no candidate with a non-zero weight for model alias '{alias}'"),
-            ));
-        };
-        placed
+    let placed: Option<Placed<'_>> = match affinity {
+        // An explicit pin is checked before the session table and honored
+        // whatever the box is doing: the caller named this box, and a transport
+        // failure against it is reported, not routed around. It bypasses
+        // placement, so a demoted box keeps serving the sessions pinned to it.
+        Some(session::Affinity::ExplicitPin { provider, model }) => candidates
+            .iter()
+            .find(|c| c.provider_name == provider && c.model == model)
+            .map(|candidate| Placed {
+                candidate,
+                reason: Placement::ExplicitPin,
+            })
+            // A pin naming no candidate of this alias is not a pin: the turn is
+            // placed, as it was before the header existed.
+            .or_else(|| place_turn(&state, candidates, &alias, session_key)),
+        // A session key: every turn after the first rides the pin, busy or not.
+        Some(session::Affinity::SessionKey(key)) => state
+            .pinned_candidate(&alias, key, candidates)
+            .map(|candidate| Placed {
+                candidate,
+                reason: Placement::Pinned,
+            })
+            // No pin, an expired one, an evicted one, or a demoted box: this
+            // turn is placed, and the box it lands on becomes the session's.
+            .or_else(|| place_turn(&state, candidates, &alias, Some(key))),
+        None => place_turn(&state, candidates, &alias, None),
+    };
+    let Some(placed) = placed else {
+        // Reachable only when the alias has no candidate to place at all:
+        // every candidate demoted still serves a turn (see `router::place`),
+        // so this is a config shape, not a box being down.
+        return Ok(json_error(
+            hyper::StatusCode::BAD_GATEWAY,
+            &format!("no candidate with a non-zero weight for model alias '{alias}'"),
+        ));
     };
 
     // One line per request naming why this box: the reason the placement path
@@ -293,6 +344,10 @@ pub async fn handle_request(
             model = %placed.candidate.model,
             mode = latency_mode.as_str(),
             reason = placed.reason.as_str(),
+            // The session key, when the request carried one: the identity the
+            // pin is stored under, so "why this box for this conversation?" is
+            // answerable from the log. Empty when the turn had no session.
+            session = session_key.unwrap_or(""),
             shares = %router::placement_schedule(candidates),
             demoted = %router::demotion_report(candidates, &state.tracker),
             "routing decision"
@@ -436,6 +491,29 @@ pub async fn handle_request(
             ))
         }
     }
+}
+
+/// Place a turn, and pin the session it belongs to to whatever it lands on.
+///
+/// One call covers both ways a pin comes into being: the first turn of a
+/// session key (a fresh pick, by weight and busyness) and a turn overflowed off
+/// a demoted box (a re-pin). Recording is what makes a placement a pin, so the
+/// table always holds the box the session's last turn actually used.
+///
+/// A turn with no session key pins nothing: an anonymous request is not a
+/// session's claim on a box, and a caller that names its box outright is
+/// already pinned by the header.
+fn place_turn<'a>(
+    state: &AppState,
+    candidates: &'a [ResolvedCandidate],
+    alias: &str,
+    session_key: Option<&str>,
+) -> Option<Placed<'a>> {
+    let placed = router::place(candidates, alias, &state.rr_state, &state.tracker)?;
+    if let Some(key) = session_key {
+        state.pin_session(alias, key, placed.candidate.stats_index);
+    }
+    Some(placed)
 }
 
 fn json_response(status: hyper::StatusCode, body: Bytes) -> Response<BoxBody> {
@@ -720,8 +798,9 @@ fn observed_report(state: &AppState, stats_index: usize) -> serde_json::Value {
 /// `GET /status`: every candidate as the router currently sees it — its health
 /// (cold/warm/demoted) and, when demoted, the seconds left in its window, the
 /// declared weight and traffic share it holds in each alias that can use it,
-/// how many requests it is serving right now, and the latencies and error rate
-/// the router measures without routing on. Weights
+/// how many requests it is serving right now, how many sessions this instance
+/// has pinned to it, and the latencies and error rate the router measures
+/// without routing on. Weights
 /// come from the same [`router::placement_schedule`] the picker draws from, so
 /// the reported numbers and the routing decision cannot drift apart.
 ///
@@ -731,6 +810,17 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
     // Aliases sorted so repeated curls diff cleanly; the map itself is a HashMap.
     let mut aliases = state.model_map.alias_names();
     aliases.sort_unstable();
+
+    // The session table, read once for the whole render: the counts an operator
+    // reads are the ones the request path consulted, so the endpoint cannot
+    // drift from the router. A poisoned table is read as it stands — the
+    // invariant it protects is affinity, and a stale count is worth less than
+    // a `/status` that stopped answering.
+    let table = match state.sessions.lock() {
+        Ok(table) => table,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let sessions: &SessionTable = &table;
 
     let mut candidates = Vec::new();
     for alias in aliases {
@@ -780,6 +870,11 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
                 // word an operator sees in a log line is readable here.
                 "in_flight": state.tracker.in_flight(stats_index),
                 "busy": state.tracker.in_flight(stats_index) > 0,
+                // Sessions this instance has pinned to this box, from the same
+                // table the request path consults. It is a count of sessions,
+                // not of turns: `in_flight` is what is running here now, this is
+                // whose conversations come back here.
+                "sessions_pinned": sessions.pinned_count(stats_index),
                 "routing": routing_report(entry),
                 "observed": observed_report(state, stats_index),
             }));
@@ -787,6 +882,15 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
     }
     let body = serde_json::json!({
         "candidates": candidates,
+        // The whole table: how many sessions this instance is holding pins for,
+        // the cap it holds them to, and the quiet that drops a pin. Per
+        // instance — a second replica answers this question about its own
+        // sessions, and nothing is shared between them.
+        "sessions": {
+            "pinned": sessions.len(),
+            "limit": sessions.limit(),
+            "idle_ttl_secs": sessions.idle_ttl_secs(),
+        },
     });
     // serializing the status object can't fail.
     #[allow(clippy::expect_used)]

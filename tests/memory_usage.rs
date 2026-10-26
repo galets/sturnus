@@ -12,13 +12,14 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)]
 
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sturnus::metrics::Metrics;
 use sturnus::model_map::ModelMap;
 use sturnus::router::RoundRobinState;
 use sturnus::server::{run_server, AppState, BufferBudget};
+use sturnus::session::SessionTable;
 use sturnus::tracker::Tracker;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -112,6 +113,7 @@ fast = [{{ provider = "test", model = "test-model" }}]
         model_map,
         tracker,
         rr_state,
+        sessions: Mutex::new(SessionTable::default()),
         client: reqwest::Client::new(),
         gcp_token_provider: None,
         budget: BufferBudget::new(128 * 1024 * 1024, 32 * 1024 * 1024),

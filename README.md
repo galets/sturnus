@@ -60,7 +60,7 @@ response = client.chat.completions.create(
 
 - **Declared-weight routing** — every candidate of an alias declares an integer `weight` (default 1) and gets `weight / sum(weights)` of that alias's traffic. The split is the arithmetic the config states, drawn deterministically, and nothing measured — latency, error rate, queue depth — scales it. Latency and success-rate EWMAs are still recorded and shown on `/status`, labelled as not used for routing.
 - **Demotion on transport failure** — a box that cannot be reached (connect, DNS, TLS, connect timeout, read timeout) takes no new sessions for `routing.demotion_secs` (default 10) and is fully eligible again when the window ends. A box that answers is a box that is up: an upstream `4xx`/`5xx` is relayed verbatim and does not demote. The health model is a timer, not a feedback loop — nothing probes a demoted box, no share is reserved for it, and it does not win traffic back gradually.
-- **Session affinity** — a stateless `x-session-affinity` header pins follow-up requests to the same provider across pods.
+- **Session affinity** — the `x-session-affinity` header carries two shapes. A `provider/model` pin is stateless: it names the box outright, and works across pods with no shared state. A session key — a conversation id the client sends — is pinned in this instance's bounded table, so the first turn is placed by weight and every later turn rides the same box, keeping its prompt cache warm.
 - **Transparent passthrough** — only the `model` field is rewritten: the request body is otherwise forwarded byte-for-byte, preserving key order, number precision, and formatting. Responses, including SSE `text/event-stream` chunks, are relayed untouched as they arrive.
 - **Memory-bounded** — request buffers are capped per request and in aggregate; bursts beyond the memory budget shed load with `429` + `Retry-After` instead of OOMing the pod.
 - **Vertex AI support** — GKE Workload Identity auth via the metadata server, with automatic token refresh.
@@ -237,15 +237,16 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
       "model": "llama-3.3-70b",
       "observed": {
         "error_rate": 0.0,
-        "nonstreaming_ewma_ms": 134,
+        "nonstreaming_ewma_ms": 136,
         "note": "measured, not used for routing: allocation is by declared weight",
-        "streaming_ewma_ms": 131
+        "streaming_ewma_ms": 132
       },
       "provider": "groq",
       "routing": {
         "share": 0.6,
         "weight": 3
       },
+      "sessions_pinned": 2,
       "status": "warm"
     },
     {
@@ -256,15 +257,16 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
       "model": "gpt-4o-mini",
       "observed": {
         "error_rate": 0.0,
-        "nonstreaming_ewma_ms": 201,
+        "nonstreaming_ewma_ms": 202,
         "note": "measured, not used for routing: allocation is by declared weight",
-        "streaming_ewma_ms": 200
+        "streaming_ewma_ms": 202
       },
       "provider": "openai",
       "routing": {
         "share": 0.2,
         "weight": 1
       },
+      "sessions_pinned": 1,
       "status": "warm"
     },
     {
@@ -284,9 +286,15 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
         "share": 0.2,
         "weight": 1
       },
+      "sessions_pinned": 0,
       "status": "demoted"
     }
-  ]
+  ],
+  "sessions": {
+    "idle_ttl_secs": 1800,
+    "limit": 1024,
+    "pinned": 3
+  }
 }
 ```
 
@@ -297,6 +305,8 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
 - **`routing`** — the whole allocation policy, as declared: `weight` is the integer the config gave this candidate in this alias, and `share` is that weight over the alias's total weight. Nothing measured scales it. The `local` row above is the point of the design: it has a 76% error-rate EWMA, and its declared share is exactly what its weight says, because a share is not something the router discovers. Note what the two fields say about a demoted box: `share` is the share its weight buys it *when it is eligible*, and `demotion_secs_left` is why it is taking nothing right now — the demotion is a window on a clock, not a discount applied to the declared number.
 - **`observed`** — what the box has been measured doing: the streaming TTFC and non-streaming response-time EWMAs (`null` while cold in that mode) and the error-rate EWMA, under a `note` saying they are not used for routing. Seeing a box that has quietly gotten slow is, in this design, a human reading a number and changing a `weight`.
 - **Weights are per alias.** A candidate reachable through several aliases appears once per alias, because its share is relative to whoever it competes with there.
+- **`sessions_pinned`** — how many of this instance's [session pins](#session-affinity) currently point at this box. It is a count of *sessions*, not of turns: `in_flight` is what is running here right now, this is whose conversations come back here. A box can show `0` in flight and a large number pinned — idle, and not idle for long.
+- **`sessions`** — the whole table beside the candidates: `pinned` is how many sessions this instance is holding a pin for, `limit` is the cap it holds them to (`routing.session_table_limit`, evicting the least recently used), and `idle_ttl_secs` is how long a session can go quiet before its pin is dropped (`routing.session_ttl_secs`). It is per instance: a second replica answers this question about its own sessions, and nothing is shared between them.
 - The numbers come from the same placement schedule the picker draws from, so `/status` and the routing decision cannot drift apart, and rendering them consumes no pick. They describe what the router would do *now*: a request riding an `x-session-affinity` pin bypasses the placement path entirely and follows none of it.
 
 ### Logging
@@ -310,10 +320,10 @@ A caller that hangs up mid-request (closing the write half or the whole connecti
 At `debug` each routed request also logs the decision behind its `INFO routing request` line: the alias, the candidate that won, why it won, every candidate's declared share of the alias, and the boxes the placement skipped because they are demoted, with the seconds left on each window — the same numbers `/status` reports:
 
 ```text
-DEBUG routing decision alias=fast provider=groq model=llama-3.3-70b mode="nonstreaming" reason="fresh-by-weight" shares=groq/llama-3.3-70b=60.0% openai/gpt-4o-mini=20.0% local/qwen3-32b=20.0% demoted=local/qwen3-32b=10s
+DEBUG routing decision alias=fast provider=groq model=llama-3.3-70b mode="nonstreaming" reason="fresh-by-weight" session="719f3c2e-4b17-4f0a-9d1c" shares=groq/llama-3.3-70b=60.0% openai/gpt-4o-mini=20.0% local/qwen3-32b=20.0% demoted=local/qwen3-32b=10s
 ```
 
-`demoted=` is empty when nothing is demoted, so a healthy alias reads exactly as it did. The `reason` is one of `fresh-by-weight` (placed on an idle candidate by weight), `overflow-busy` (every candidate was busy, so the least busy took it), `overflow-demoted` (the alias had nothing eligible, so the heaviest demoted box served the turn), `explicit-pin` (the request rode an `x-session-affinity` pin, and bypassed placement). A transport failure logs its own line at `WARN` naming the window it just started (`demoted_for_secs`), so the demotion and the placement that avoided it are both in the log.
+`demoted=` is empty when nothing is demoted, so a healthy alias reads exactly as it did, and `session=` is empty when the request carried no session key. The `reason` is one of `fresh-by-weight` (placed on an idle candidate by weight), `overflow-busy` (every candidate was busy, so the least busy took it), `overflow-demoted` (the alias had nothing eligible, so the heaviest demoted box served the turn), `explicit-pin` (the request rode an `x-session-affinity` pin naming a box, and bypassed placement), `pinned` (the request rode a [session pin](#session-affinity), and bypassed placement). A session key's first turn logs the placement it made, so the line that created the pin reads like any other placement, and only the turns after it read `reason="pinned"`. A transport failure logs its own line at `WARN` naming the window it just started (`demoted_for_secs`), so the demotion and the placement that avoided it are both in the log.
 
 ## Session affinity
 
@@ -333,20 +343,42 @@ response = client.chat.completions.create(
 )
 ```
 
-Fully stateless — works across pods with no shared state. The pin is honored whatever the pinned box's error rate: an explicit `provider/model` pin is the operator or the caller naming that box, so a transport failure against it is reported, not routed around, and a demoted box keeps serving the sessions pinned to it. Nothing breaks the header; unknown or malformed headers fall back to normal routing. (The error-rate threshold that used to break pins is gone — see [What config cannot do](#what-config-cannot-do).)
+The header names two different things, and the router reads it as the shape it finds:
 
-A honored pin bypasses the placement path entirely, and its `debug` line says so — the same `routing decision` line, with `reason="explicit-pin"` and the alias, provider and model — rather than looking like the `reason="fresh-by-weight"` decision a routed request logs.
+```
+x-session-affinity: provider/model        ← an explicit pin: route to this box
+x-session-affinity: 719f3c2e-4b17-4f0a-…  ← a session key: keep this conversation put
+```
+
+A **pin** is a model name, so it is routed like any other request: the model must be in the config, and the box serving it is chosen by the weights. It is fully stateless — the header carries the whole decision, so it works across pods with no shared state. Every response echoes one, which is why the snippet above works: the client is sending a pin, not a session.
+
+A **session key** is not a model, so it is not routed at all. It is a label — a conversation id from the client's own session store — and the router gives that label a home: the first turn of a session is placed by the normal rules, and every later turn of that session rides to the same box, busy or not. That is the shape a client with prompt caching wants: the box that has already paid for the prompt is the box worth queuing behind.
+
+The two shapes are separated by a slash, which a session id does not contain, so a client that sends both kinds is not making a mistake. Anything else — empty, a leading or trailing slash, a `provider/model` that is not a candidate of this alias — is not usable, and the request is placed normally. Nothing is ever refused for a header the router cannot use.
+
+The pin is honored whatever the pinned box's error rate: an explicit `provider/model` pin is the operator or the caller naming that box, so a transport failure against it is reported, not routed around, and a demoted box keeps serving the sessions pinned to it. Nothing breaks the header; unknown or malformed headers fall back to normal routing. (The error-rate threshold that used to break pins is gone — see [What config cannot do](#what-config-cannot-do).)
+
+A honored pin bypasses the placement path entirely, and its `debug` line says so — the same `routing decision` line, with `reason="explicit-pin"` for a pin, `reason="pinned"` for a session key, and the session key beside the box it resolved to — rather than looking like the `reason="fresh-by-weight"` decision a routed request logs.
+
+What a session pin buys, and what it costs:
+
+* **It is per alias, not per conversation.** Two aliases for the same conversation pin independently, so a client that sends one id under two routing keys gets two boxes. That is the honest answer: the two aliases may name different models, and a box that has cached one prompt has not cached the other.
+* **It is per instance.** The table is in-process memory. Behind more than one replica, each replica places the session on its own first turn, so the pin only holds once traffic is sticky at the layer above. The startup log says so. A `provider/model` pin, by contrast, carries its decision in the header and needs nothing from this process.
+* **It is bounded.** A session is forgotten after `routing.session_ttl_secs` of quiet (default 1800), and the table holds at most `routing.session_table_limit` sessions (default 1024), evicting the least recently used. Both bounds are a cost, not a safety margin: a session that crosses one places fresh, which is exactly the cache miss affinity was bought to avoid.
+* **A demotion re-pins, permanently.** When the box a session is pinned to is demoted, the next turn is placed fresh, and the session is pinned to the new box. Nothing moves it back when the old box's window expires. A pin is not an affinity for a particular machine; it is an answer to "where has this conversation been going", and a box that failed to answer is not that answer any more.
+* **A pinned turn is honored while its box is busy.** It goes to a box that is mid-prompt or over its memory budget, and queues there. That is the point: the box with the cache is the one worth the queue. A box that is *demoted* is the one exception — it takes no new sessions, and a session overflowed off it is new to the box it lands on, so that turn re-pins (see above).
 
 ## How routing works
 
 1. Client sends `POST /v1/chat/completions` with `"model": "fast"`.
-2. Sidecar looks up the `fast` alias and reads each candidate's declared `weight` (an integer, default 1). A candidate's share of the alias is `its weight / sum of weights` — that is the entire allocation policy, and nothing measured — latency, error rate, queue depth — scales it.
-3. Eligibility is applied first, as a gate and not a discount: a candidate inside a demotion window is not asked at all, so its share while demoted is exactly zero. No slice of the alias is held aside for it, because nothing probes a demoted box back.
-4. Among the eligible candidates, busyness decides who gets asked and weight decides between them. A candidate with a prompt running is passed over for an idle one whatever its weight; when every candidate is busy the least busy group competes, and weight breaks that tie.
-5. A deterministic low-discrepancy sequence (the golden-ratio Weyl sequence) over the alias's pick counter turns those weights into picks: equal weights alternate exactly, a 2:1 pair splits 2:1 over a long run, and there is no RNG to seed, so a split is reproducible in a test and in a debug log.
-6. When every candidate of the alias is demoted the turn still goes out, on the heaviest demoted box, and the caller gets that box's own response — a dead box's own error is more informative than a `502` the proxy invented.
-7. The `model` field is rewritten to the real model name, auth headers are set, and the request is forwarded.
-8. TTFC is measured at first chunk arrival and fed into the latency EWMA; the response status (any non-2xx counts as an error, including upstream 4xx) feeds the success-rate EWMA. Both are reported on `/status`, and neither feeds the pick. A request that never got a response at all — connect, DNS, TLS, connect timeout, read timeout — starts the box's demotion window instead.
+2. The `x-session-affinity` header is read before anything is placed, and its shape decides what it means: a `provider/model` value names a box outright, and a value without a slash is a session key whose pin is looked up. Both bypass steps 3–6. A key with no live pin — new, quiet past the idle TTL, evicted at the table cap, or pinned to a box that is now demoted — falls through to placement, and the box it lands on becomes that key's pin.
+3. Sidecar looks up the `fast` alias and reads each candidate's declared `weight` (an integer, default 1). A candidate's share of the alias is `its weight / sum of weights` — that is the entire allocation policy, and nothing measured — latency, error rate, queue depth — scales it.
+4. Eligibility is applied first, as a gate and not a discount: a candidate inside a demotion window is not asked at all, so its share while demoted is exactly zero. No slice of the alias is held aside for it, because nothing probes a demoted box back.
+5. Among the eligible candidates, busyness decides who gets asked and weight decides between them. A candidate with a prompt running is passed over for an idle one whatever its weight; when every candidate is busy the least busy group competes, and weight breaks that tie.
+6. A deterministic low-discrepancy sequence (the golden-ratio Weyl sequence) over the alias's pick counter turns those weights into picks: equal weights alternate exactly, a 2:1 pair splits 2:1 over a long run, and there is no RNG to seed, so a split is reproducible in a test and in a debug log.
+7. When every candidate of the alias is demoted the turn still goes out, on the heaviest demoted box, and the caller gets that box's own response — a dead box's own error is more informative than a `502` the proxy invented.
+8. The `model` field is rewritten to the real model name, auth headers are set, and the request is forwarded.
+9. TTFC is measured at first chunk arrival and fed into the latency EWMA; the response status (any non-2xx counts as an error, including upstream 4xx) feeds the success-rate EWMA. Both are reported on `/status`, and neither feeds the pick. A request that never got a response at all — connect, DNS, TLS, connect timeout, read timeout — starts the box's demotion window instead.
 
 The share is written, not discovered: the 95% box is `weight = 19` beside `weight = 1`. The trade is explicit — the router does not notice on its own that a box has gotten slow, because it is not looking. `/status` reports the latency EWMA so an operator can notice, and the fix is a `weight`. A box that is *unreachable* is the one exception: that is a box that did not answer, and the router acts on it, by standing it down for a window.
 
@@ -380,12 +412,12 @@ A box that cannot be reached stops taking new placements for `routing.demotion_s
 
 ### What config cannot do
 
-The routing keys are `ewma_alpha` (the smoothing of the EWMAs `/status` reports), `demotion_secs` (the length of a stand-down window), alongside the timeouts and the body-size caps. There is no key for:
+The routing keys are `ewma_alpha` (the smoothing of the EWMAs `/status` reports), `demotion_secs` (the length of a stand-down window), `session_ttl_secs` and `session_table_limit` (the two bounds on the session-pin table), alongside the timeouts and the body-size caps. There is no key for:
 
 - **Making a measured number count.** Latency, error rate and queue depth are recorded and reported, and no weight is scaled by any of them. There is no sharpness knob to turn, and `routing.exploit_k` — the knob this design removed — is a startup error naming `weight` as its replacement, not a key that loads and does nothing.
 - **Grading a box's health on a curve.** `routing.error_threshold` — the error-rate EWMA above which a session-affinity pin was broken — is gone for the same reason: a startup error naming `demotion_secs`. Health is binary on purpose: a box that answered is up, a box that did not is stood down for a window. There is no key for the failure rate that starts a window, no decay curve, no half-life, and no threshold at which a box is "bad enough".
 - **Probing a demoted box back.** There is no probe share, no probe interval, no ramp, and no recovery ladder to configure: the window expires and the box is at full weight, and the first session placed on it is the probe.
-- **Disabling or bounding session affinity.** A caller-supplied `x-session-affinity` pin is honored whatever the pinned box is doing — there is no turn limit, no error rate that breaks it, and no setting that ignores the header. A handful of long-lived sessions can therefore hold one candidate at 100% of their own traffic however idle it looks to the router.
+- **Disabling session affinity, or tuning how hard a live session sticks.** A caller-supplied `x-session-affinity` pin is honored whatever the pinned box is doing — there is no turn limit, no error rate that breaks it, and no setting that ignores the header. A handful of long-lived sessions can therefore hold one candidate at 100% of their own traffic however idle it looks to the router. The two keys that do exist bound the *table*, not the affinity: `session_ttl_secs` is how long a session may go quiet before its pin is dropped, and `session_table_limit` is how many sessions are held before the least recently used goes. Neither changes where a live, in-window session goes.
 - **A floor, a ceiling, or a preference a box carries.** Weight is declared per candidate inside one alias's list, so the same box can be `weight = 3` in one alias and `weight = 1` in another; there is no global preference, no floor keeping a broken box sampled, and no ceiling on a healthy one. The list is the policy.
 
 ## Docker
