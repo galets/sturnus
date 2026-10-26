@@ -36,6 +36,12 @@ pub struct CandidateStats {
     /// [`InFlightGuard`]. A count of a *candidate*, not of an alias: one box
     /// reachable through several aliases has one queue, not one per alias.
     in_flight: AtomicUsize,
+    /// Turns this candidate has been given since startup, incremented on the
+    /// same path that increments `in_flight` and never returned. A counter,
+    /// not a gauge: a turn that failed at the transport level counted too,
+    /// because the box was given the turn. Observability only — routing reads
+    /// the outstanding count, never this cumulative one.
+    turns_served: AtomicUsize,
     /// The instant, on the tracker's clock, until which this candidate is
     /// demoted. `0` means never: the clock starts at `0`, so a deadline at or
     /// before the clock's own start has already passed and the candidate is
@@ -56,6 +62,7 @@ impl CandidateStats {
             nonstreaming_ewma_ms: AtomicU64::new(u64::MAX),
             success_rate: AtomicU64::new(1.0_f64.to_bits()),
             in_flight: AtomicUsize::new(0),
+            turns_served: AtomicUsize::new(0),
             demoted_until_ms: AtomicU64::new(0),
         }
     }
@@ -82,6 +89,16 @@ impl CandidateStats {
     /// Requests outstanding against this candidate right now.
     pub fn in_flight(&self) -> usize {
         self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Turns this candidate has been given since startup.
+    ///
+    /// Cumulative and never returned, so it answers "how much has this box
+    /// actually carried?" where `in_flight` answers "how much is it
+    /// carrying right now?". It counts dispatches, not successes: a turn that
+    /// ended in a connect failure was served by this box.
+    pub fn turns_served(&self) -> usize {
+        self.turns_served.load(Ordering::Relaxed)
     }
 
     /// Push the demotion deadline out to `until_ms`, on the tracker's clock.
@@ -181,6 +198,11 @@ impl Tracker {
         self.stats[index].in_flight()
     }
 
+    /// Turns the candidate at `index` has been given since startup.
+    pub fn turns_served(&self, index: usize) -> usize {
+        self.stats[index].turns_served()
+    }
+
     /// Count a request against the candidate it was just dispatched to, and
     /// return the handle that owns that count.
     ///
@@ -200,8 +222,14 @@ impl Tracker {
     /// connect failure, a timeout, an upstream 5xx and a caller that hangs up
     /// mid-stream all drop the guard, and nothing else has to remember to
     /// decrement.
+    ///
+    /// The same dispatch also increments the candidate's cumulative
+    /// `turns_served`, which is never returned: the two counts come from one
+    /// place, so "outstanding now" and "served in total" cannot disagree about
+    /// what a dispatch was.
     pub fn dispatch(&self, index: usize) -> InFlightGuard {
         let stats = Arc::clone(&self.stats[index]);
+        stats.turns_served.fetch_add(1, Ordering::Relaxed);
         stats.in_flight.fetch_add(1, Ordering::Relaxed);
         InFlightGuard { stats }
     }

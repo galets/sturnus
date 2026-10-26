@@ -225,6 +225,81 @@ fn display_renders_the_share_line_the_debug_log_wants() {
 }
 
 #[test]
+fn the_load_line_names_every_candidate_s_weight_and_state() {
+    // The debug line's `load=` field: every candidate of the alias, its
+    // declared weight, its outstanding turns, and the busy/idle state the
+    // placement rule acted on — the inputs, not just the answer.
+    let (candidates, tracker, _rr) = setup(&[("cuda30", 2), ("llama30", 1)]);
+    let schedule = placement_schedule(&candidates);
+    assert_eq!(
+        scheduled_load(&schedule, &tracker).to_string(),
+        "cuda30/m=w2,t0,idle llama30/m=w1,t0,idle",
+        "an idle alias reads idle everywhere"
+    );
+
+    // One prompt on the weight-2 box: the state the next placement reads.
+    let guards = busy(&tracker, &candidates[0], 1);
+    assert_eq!(
+        scheduled_load(&schedule, &tracker).to_string(),
+        "cuda30/m=w2,t1,busy llama30/m=w1,t0,idle"
+    );
+
+    // The turns come back with the guards, and the line follows.
+    drop(guards);
+    assert_eq!(
+        scheduled_load(&schedule, &tracker).to_string(),
+        "cuda30/m=w2,t0,idle llama30/m=w1,t0,idle"
+    );
+}
+
+#[test]
+fn the_load_line_carries_the_same_numbers_the_placement_read() {
+    // The load field is not a second opinion: it reads the same counts
+    // `place` compares, so the reason on the line and the load beside it are
+    // one decision's inputs.
+    let (candidates, tracker, rr) = setup(&[("fast", 19), ("slow", 1)]);
+    let heavy = busy(&tracker, &candidates[0], 2);
+    let placed = place(&candidates, "test", &rr, &tracker).unwrap();
+    let schedule = placement_schedule(&candidates);
+    let load = scheduled_load(&schedule, &tracker).to_string();
+
+    // One box busy, one idle: the idle box takes the session, and the line
+    // shows the turns that cost the heavy box its weight.
+    assert_eq!(
+        placed.reason,
+        Placement::FreshByWeight,
+        "an idle box existed: {placed:?}"
+    );
+    assert_eq!(placed.candidate.provider_name, "slow");
+    assert!(
+        load.contains("fast/m=w19,t2,busy"),
+        "the turns the placement compared are on the line: {load}"
+    );
+    assert!(
+        load.contains("slow/m=w1,t0,idle"),
+        "and so is the box that won: {load}"
+    );
+
+    // Every box busy is the other reason, and the counts beside it are the
+    // ones that decided it.
+    let light = busy(&tracker, &candidates[1], 1);
+    let placed = place(&candidates, "test", &rr, &tracker).unwrap();
+    let load = scheduled_load(&schedule, &tracker).to_string();
+    assert_eq!(
+        placed.reason,
+        Placement::OverflowBusy,
+        "nothing was idle: {placed:?}"
+    );
+    assert!(
+        load.contains("fast/m=w19,t2,busy") && load.contains("slow/m=w1,t1,busy"),
+        "the least-busy comparison is on the line: {load}"
+    );
+
+    drop(heavy);
+    drop(light);
+}
+
+#[test]
 fn a_zero_total_weight_reports_zero_share_not_nan() {
     // Unreachable through config (weights are validated >= 1), but these
     // numbers are rendered, and a NaN reaching an operator is worse than 0.0.

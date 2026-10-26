@@ -333,11 +333,13 @@ pub async fn handle_request(
     };
 
     // One line per request naming why this box: the reason the placement path
-    // produced, beside the declared weights it drew from — the same numbers
-    // `/status` reports — and beside the boxes it skipped because they are
-    // demoted, with the time left on each. Gated so the schedule is not built
-    // for a request the log level will not show.
+    // produced, beside the declared weights it drew from and every candidate's
+    // load at that moment — the same numbers `/status` reports — and beside
+    // the boxes it skipped because they are demoted, with the time left on
+    // each. Gated so the schedule is not built for a request the log level
+    // will not show.
     if tracing::enabled!(tracing::Level::DEBUG) {
+        let schedule = router::placement_schedule(candidates);
         debug!(
             alias = %alias,
             provider = %placed.candidate.provider_name,
@@ -348,11 +350,31 @@ pub async fn handle_request(
             // pin is stored under, so "why this box for this conversation?" is
             // answerable from the log. Empty when the turn had no session.
             session = session_key.unwrap_or(""),
-            shares = %router::placement_schedule(candidates),
+            shares = %&schedule,
+            // Every candidate's weight, outstanding turns and busy/idle state
+            // as the placement read them: the inputs the busyness rule used,
+            // so the reason on this line is checkable from the same line.
+            load = %router::scheduled_load(&schedule, &state.tracker),
             demoted = %router::demotion_report(candidates, &state.tracker),
             "routing decision"
         );
     }
+
+    // The same reason, counted rather than logged: every proxied request
+    // increments one series per (alias, candidate, reason), so "where did this
+    // alias's traffic go, and why?" is a query, and a turn that rode a pin is
+    // visible as a pin rather than blending into the weighted picks. Counted
+    // outside the debug gate, because the count is not a log's business.
+    state
+        .metrics
+        .placements_total
+        .with_label_values(&[
+            alias.as_str(),
+            placed.candidate.provider_name.as_str(),
+            placed.candidate.model.as_str(),
+            placed.reason.as_str(),
+        ])
+        .inc();
 
     let candidate = placed.candidate;
 
@@ -548,8 +570,12 @@ fn encode_metrics_response(state: &AppState) -> Response<BoxBody> {
     // The in-flight gauge mirrors counts that live in the tracker, so it is
     // written from them at scrape time rather than incremented alongside them:
     // the exported number then cannot drift from the real count, and cannot
-    // stick above zero after a request is over.
+    // stick above zero after a request is over. The sessions-pinned gauge is
+    // written the same way, from the live session table.
     state.metrics.set_in_flight(&in_flight_samples(state));
+    state
+        .metrics
+        .set_sessions_pinned(&sessions_pinned_samples(state));
     match state.metrics.encode() {
         Ok(buf) => {
             let body = Bytes::from(buf);
@@ -586,6 +612,35 @@ fn in_flight_samples(state: &AppState) -> Vec<(&str, &str, &str, usize)> {
                 candidate.provider_name.as_str(),
                 candidate.model.as_str(),
                 state.tracker.in_flight(candidate.stats_index),
+            )
+        })
+        .collect()
+}
+
+/// One `(alias, provider, model, count)` row per candidate, for the
+/// sessions-pinned gauge, read from the live table at scrape time exactly as
+/// [`in_flight_samples`] reads the tracker. The exported number is the one the
+/// request path consulted, so it cannot drift from the table and cannot stick
+/// above zero after a session's pin expires or is evicted.
+///
+/// A candidate reachable through several aliases appears once per alias with
+/// the same count, as the in-flight gauge does: the pins are the box's, not
+/// the alias's. A poisoned table is read as it stands, as `/status` reads it.
+fn sessions_pinned_samples(state: &AppState) -> Vec<(&str, &str, &str, usize)> {
+    let table = match state.sessions.lock() {
+        Ok(table) => table,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let sessions: &SessionTable = &table;
+    state
+        .model_map
+        .iter()
+        .map(|(alias, candidate)| {
+            (
+                alias,
+                candidate.provider_name.as_str(),
+                candidate.model.as_str(),
+                sessions.pinned_count(candidate.stats_index),
             )
         })
         .collect()
@@ -870,6 +925,12 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
                 // word an operator sees in a log line is readable here.
                 "in_flight": state.tracker.in_flight(stats_index),
                 "busy": state.tracker.in_flight(stats_index) > 0,
+                // Cumulative since startup, from the same dispatch that
+                // increments `in_flight`: this box has been given this many
+                // turns, and a turn that failed at the transport level is one
+                // of them. Not a routing input — placement reads the
+                // outstanding count, never this total.
+                "turns_served": state.tracker.turns_served(stats_index),
                 // Sessions this instance has pinned to this box, from the same
                 // table the request path consults. It is a count of sessions,
                 // not of turns: `in_flight` is what is running here now, this is

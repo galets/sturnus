@@ -70,6 +70,19 @@ pub enum Placement {
 }
 
 impl Placement {
+    /// Every reason, in the order the placement path can produce them.
+    ///
+    /// `Metrics::init_zero` walks this so a reason that has never been chosen
+    /// exports a `0` series rather than no series, and adding a variant is a
+    /// list to update rather than a metric that quietly goes missing.
+    pub const ALL: [Self; 5] = [
+        Placement::ExplicitPin,
+        Placement::Pinned,
+        Placement::FreshByWeight,
+        Placement::OverflowBusy,
+        Placement::OverflowDemoted,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Placement::ExplicitPin => "explicit-pin",
@@ -109,6 +122,74 @@ pub struct PlacementSchedule<'a> {
     pub entries: Vec<ScheduledCandidate<'a>>,
     /// Sum of every entry's weight; the modulus of the weighted draw.
     pub total_weight: usize,
+}
+
+/// The schedule beside each candidate's live load, as the routing debug line
+/// wants it:
+///
+/// `alpha/m-alpha=w2,t1,busy beta/m-beta=w1,t0,idle`
+///
+/// One candidate per entry, in schedule order: the weight it declared, the
+/// turns it has outstanding, and the busy/idle state the placement rule acted
+/// on. Those are the three inputs the busyness half of the rule reads, so one
+/// line answers "why this box, this turn?" beside the `shares=` the weight
+/// half drew from.
+///
+/// `Display` for the same reason [`PlacementSchedule`]'s is: the routing line
+/// is gated behind `tracing::enabled!`, so `debug!(load = %scheduled_load(…))`
+/// renders nothing until the callsite is enabled. The counts are read when
+/// this is built — at the moment the placement was made, which is the moment
+/// the line is answering for.
+#[derive(Debug)]
+pub struct ScheduledLoad<'a> {
+    schedule: &'a PlacementSchedule<'a>,
+    /// One entry per `schedule.entries`, read at construction.
+    in_flight: Vec<usize>,
+}
+
+impl std::fmt::Display for ScheduledLoad<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, (entry, turns)) in self
+            .schedule
+            .entries
+            .iter()
+            .zip(&self.in_flight)
+            .enumerate()
+        {
+            if i > 0 {
+                f.write_str(" ")?;
+            }
+            write!(
+                f,
+                "{}/{}=w{},t{},{}",
+                entry.candidate.provider_name,
+                entry.candidate.model,
+                entry.weight,
+                turns,
+                if *turns > 0 { "busy" } else { "idle" }
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// The schedule `schedule` beside each candidate's outstanding-turn count.
+///
+/// Reads the same counts [`crate::router::place`] compares — one
+/// `tracker.in_flight` per candidate, no tick consumed — so the load an
+/// operator reads on the debug line is the load the placement saw.
+pub fn scheduled_load<'a>(
+    schedule: &'a PlacementSchedule<'a>,
+    tracker: &Tracker,
+) -> ScheduledLoad<'a> {
+    ScheduledLoad {
+        schedule,
+        in_flight: schedule
+            .entries
+            .iter()
+            .map(|entry| tracker.in_flight(entry.candidate.stats_index))
+            .collect(),
+    }
 }
 
 /// Every candidate's share on one line, e.g.

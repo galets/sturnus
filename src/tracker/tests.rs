@@ -239,6 +239,36 @@ fn dispatch_counts_until_its_guard_is_dropped() {
     );
 }
 
+/// The cumulative count rides the same dispatch as the outstanding one, so the
+/// two agree about what a dispatch was, and only the outstanding one comes
+/// back.
+#[test]
+fn turns_served_counts_every_dispatch_and_never_goes_back() {
+    let mut tracker = Tracker::new(0.3, 10);
+    let busy = tracker.register();
+    let idle = tracker.register();
+    assert_eq!(tracker.turns_served(busy), 0, "nothing has been served");
+
+    let first = tracker.dispatch(busy);
+    let second = tracker.dispatch(busy);
+    assert_eq!(tracker.turns_served(busy), 2, "two turns were given");
+    assert_eq!(tracker.in_flight(busy), 2, "and both are outstanding");
+
+    drop(first);
+    drop(second);
+    assert_eq!(tracker.in_flight(busy), 0, "both turns are over");
+    assert_eq!(
+        tracker.turns_served(busy),
+        2,
+        "the total is a counter: a finished turn stays counted"
+    );
+    assert_eq!(
+        tracker.turns_served(idle),
+        0,
+        "the total is per candidate, like the outstanding count"
+    );
+}
+
 /// A guard dropped twice is impossible (it is not `Clone` and `Drop` runs
 /// once), but the count is only correct if concurrent dispatches also neither
 /// lose an increment nor an decrement. 8 threads hold a shifting window of

@@ -115,6 +115,34 @@ their history lives in the git log and tags.
   per candidate, and `sessions` with `pinned`, `limit`, `idle_ttl_secs`), and
   the `debug` routing line carries `session=` beside the box, with
   `reason="pinned"` on the turns that rode a pin.
+- **The inputs to a placement are logged beside its outcome.** The `debug`
+  routing line gains `load=`, listing every candidate of the alias as
+  `provider/model=w3,t1,busy` — the weight it declares, the turns it has
+  outstanding right now, and whether it is busy — so "why did this subagent land
+  on the slow box?" is answered by the one line that logged the decision, rather
+  than by cross-referencing a share, a gauge and a demotion window from three
+  places. The line is built inside the same `debug` gate as the rest of it, so a
+  process not logging at `debug` pays nothing, and it is rendered from the same
+  placement schedule the picker drew from: the numbers on show are the ones the
+  decision used.
+- **How many turns a candidate has been given in total.** `/status` adds
+  `turns_served` per candidate, incremented at the same seam that takes a turn
+  out of `in_flight`, so it agrees with `in_flight` about what a dispatch was. It
+  counts turns that failed — the box was given that turn — and it is not an input
+  to placement: the router compares outstanding turns, never this total, so a box
+  that has carried a lot is not penalised for having carried it. Read beside
+  `share`, it shows a box whose traffic has drifted from what its weight declares.
+- **`/metrics` exports the placement rule's own audit trail.**
+  `sturnus_placements_total` counts turns placed, labelled by `alias`, `provider`,
+  `model` and `reason`, so `sum by (reason) (sturnus_placements_total{alias="…"})`
+  answers how an alias is being split in practice over a window of traffic rather
+  than in one log line; a `reason` climbing where it should be flat is the shape
+  of a box that is busy, demoted, or pinned. `sturnus_sessions_pinned` is a gauge
+  of how many sessions this instance currently pins to each candidate — sessions,
+  not turns, and per instance. Both are written from the live router state (the
+  counter at the seam that decided, the gauge from the pin table at scrape time),
+  and both are zero-initialised at startup, so an idle alias reads `0` rather than
+  no series.
 
 ### Changed
 

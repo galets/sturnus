@@ -199,7 +199,7 @@ Sidecar keys take precedence over any client-supplied `labels` keys with the sam
 | POST | `/v1/chat/completions` | Proxied to upstream (model alias resolved) |
 | POST | `/v1/embeddings` | Proxied to upstream (model alias resolved) |
 | GET | `/health` | Returns `{"status":"ok"}` |
-| GET | `/status` | Per candidate: cold/warm/degraded state, the declared weight and the traffic share it buys, the live in-flight count, and the latency EWMAs and error rate that are measured but not routed on |
+| GET | `/status` | Per candidate: cold/warm/demoted state, the declared weight and the traffic share it buys, the live in-flight count and busy/idle state, the turns it has served, the sessions pinned to it, and the latency EWMAs and error rate that are measured but not routed on |
 | GET | `/metrics` | Prometheus metrics (see below) |
 
 The `POST` proxy routes are served only on `listen`. The `GET` observability routes are served on `listen` and, when configured, on `metrics_listen`. When `api_keys` is configured, the `POST` routes additionally require `Authorization: Bearer <key>`; the observability routes never do.
@@ -216,15 +216,19 @@ Prometheus metrics on `/metrics`, all labelled by `alias`, `provider`, `model`:
 | `sturnus_ttfc_seconds` | histogram | Streaming time-to-first-chunk (streaming requests only) |
 | `sturnus_latency_seconds` | histogram | Non-streaming full response time (non-streaming requests only) |
 | `sturnus_errors_total` | counter | Transport failures that never produced a response (timeout, connect, DNS) |
+| `sturnus_placements_total` | counter | Turns placed, additionally labelled by `reason` — one of `fresh-by-weight`, `overflow-busy`, `overflow-demoted`, `pinned`, `explicit-pin`. Counted at the seam that decided, so a turn that rode a pin is visible as a pin and never blends into the weighted picks |
 | `sturnus_in_flight_requests` | gauge | Requests outstanding against the candidate right now: counted from the moment it is chosen until its response ends, errors, or is dropped mid-flight |
+| `sturnus_sessions_pinned` | gauge | Sessions this instance has pinned to the candidate right now: a count of *sessions*, not of turns, and per instance — a second replica counts its own |
 | `sturnus_buffer_rejections_total` | counter | Requests shed with `429` because the aggregate buffer budget was full (no per-alias labels) |
 | `sturnus_client_disconnects_total` | counter | Callers that hung up before their request completed (no per-alias labels). Benign: logged at debug, not ERROR |
 
-Connection failures and the in-flight gauge are zero-initialised at startup, so a missing series is never mistaken for "no errors" and an idle candidate reads `0` rather than nothing. The in-flight gauge is written from the live counts on every scrape instead of being incremented per request, so the exported number cannot drift from the real count or stick above zero after a request is over. It counts a *candidate*, not an alias: a box reachable through several aliases reports the same number under each of their label sets.
+The failure counters, both gauges and every placement reason are zero-initialised at startup, so a missing series is never mistaken for "no errors", for "nothing queued", for "no session is pinned here" or for "this reason never happened". The two gauges are written from the live counts on every scrape — the in-flight gauge from the tracker, the pin gauge from the session table — instead of being incremented per request, so the exported numbers cannot drift from the state the router reads or stick above zero once the turns and pins are gone. Both count a *candidate*, not an alias: a box reachable through several aliases reports the same number under each of their label sets.
+
+`sturnus_placements_total` is the audit trail of the placement rule: `sum by (reason) (sturnus_placements_total{alias="fast"})` answers how an alias's traffic is being split in practice, and a `reason` climbing where it should be flat is the shape of a box that is busy, demoted, or pinned.
 
 ### Status
 
-`GET /status` answers "why is this box getting this share?" in one curl, rather than as an inference from a log excerpt. Each candidate of each alias is listed with its health, what the config declares for it, and what it has been measured doing:
+`GET /status` answers "why is this box getting this share?" in one curl, rather than as an inference from a log excerpt. Each candidate of each alias is listed with its health, what the config declares for it, what it is carrying right now, and what it has been measured doing. The sample below is the endpoint's own output — a process that served 17 turns across three boxes, two prompts running on the first, and the third standing down after refusing four connections:
 
 ```json
 {
@@ -237,9 +241,9 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
       "model": "llama-3.3-70b",
       "observed": {
         "error_rate": 0.0,
-        "nonstreaming_ewma_ms": 136,
+        "nonstreaming_ewma_ms": 134,
         "note": "measured, not used for routing: allocation is by declared weight",
-        "streaming_ewma_ms": 132
+        "streaming_ewma_ms": 133
       },
       "provider": "groq",
       "routing": {
@@ -247,7 +251,8 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
         "weight": 3
       },
       "sessions_pinned": 2,
-      "status": "warm"
+      "status": "warm",
+      "turns_served": 8
     },
     {
       "alias": "fast",
@@ -257,9 +262,9 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
       "model": "gpt-4o-mini",
       "observed": {
         "error_rate": 0.0,
-        "nonstreaming_ewma_ms": 202,
+        "nonstreaming_ewma_ms": 203,
         "note": "measured, not used for routing: allocation is by declared weight",
-        "streaming_ewma_ms": 202
+        "streaming_ewma_ms": 204
       },
       "provider": "openai",
       "routing": {
@@ -267,7 +272,8 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
         "weight": 1
       },
       "sessions_pinned": 1,
-      "status": "warm"
+      "status": "warm",
+      "turns_served": 5
     },
     {
       "alias": "fast",
@@ -277,7 +283,7 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
       "model": "qwen3-32b",
       "observed": {
         "error_rate": 0.7599,
-        "nonstreaming_ewma_ms": 113,
+        "nonstreaming_ewma_ms": null,
         "note": "measured, not used for routing: allocation is by declared weight",
         "streaming_ewma_ms": null
       },
@@ -287,7 +293,8 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
         "weight": 1
       },
       "sessions_pinned": 0,
-      "status": "demoted"
+      "status": "demoted",
+      "turns_served": 4
     }
   ],
   "sessions": {
@@ -302,8 +309,9 @@ Connection failures and the in-flight gauge are zero-initialised at startup, so 
 - **`demotion_secs_left`** — whole seconds left in that window, rounded up so a reading never understates what is left, and `null` when the candidate is eligible. It is a countdown, not a score: at `0` the box is back at its full declared weight, with no ramp and nothing carried over from the demotion.
 - **`in_flight`** — requests this candidate has outstanding right now, counted from the moment it is chosen (by the router or by an `x-session-affinity` pin) until its response ends, errors, or is dropped mid-flight, so the wait it covers includes connecting, uploading, TTFB and the stream itself. It is one count per box, so a candidate listed under several aliases shows the same number in every entry, and `0` means nothing is in flight.
 - **`busy`** — `true` while a prompt is running on this candidate, i.e. `in_flight > 0`. It is the word the placement rule uses: a new session is placed on an idle candidate in preference to a busy one whatever their weights, and when every candidate of the alias is busy the least busy of them takes the session, with weight as the tiebreak. A turn of a session that is already pinned is not moved by busyness — it queues behind the running prompt on its own box.
+- **`turns_served`** — how many turns this box has been given since the process started. A counter, not a gauge: it never goes back, and a turn that ended in a connect failure is one of them, because the box was given that turn. It is the cumulative companion to `in_flight`, and it is not an input to placement — the router compares the outstanding count, never this total, so a box that has carried a lot is not penalised for it. Read it beside `share` to see a box whose traffic has drifted from what its weight declares.
 - **`routing`** — the whole allocation policy, as declared: `weight` is the integer the config gave this candidate in this alias, and `share` is that weight over the alias's total weight. Nothing measured scales it. The `local` row above is the point of the design: it has a 76% error-rate EWMA, and its declared share is exactly what its weight says, because a share is not something the router discovers. Note what the two fields say about a demoted box: `share` is the share its weight buys it *when it is eligible*, and `demotion_secs_left` is why it is taking nothing right now — the demotion is a window on a clock, not a discount applied to the declared number.
-- **`observed`** — what the box has been measured doing: the streaming TTFC and non-streaming response-time EWMAs (`null` while cold in that mode) and the error-rate EWMA, under a `note` saying they are not used for routing. Seeing a box that has quietly gotten slow is, in this design, a human reading a number and changing a `weight`.
+- **`observed`** — what the box has been measured doing, and observability only: the streaming TTFC and non-streaming response-time EWMAs (`null` while cold in that mode) and the error-rate EWMA, under a `note` saying they are not used for routing. Nothing in this block moves a share, breaks a pin, or stands a box down; the one health signal routing acts on is the demotion window above. Seeing a box that has quietly gotten slow is, in this design, a human reading a number and changing a `weight`.
 - **Weights are per alias.** A candidate reachable through several aliases appears once per alias, because its share is relative to whoever it competes with there.
 - **`sessions_pinned`** — how many of this instance's [session pins](#session-affinity) currently point at this box. It is a count of *sessions*, not of turns: `in_flight` is what is running here right now, this is whose conversations come back here. A box can show `0` in flight and a large number pinned — idle, and not idle for long.
 - **`sessions`** — the whole table beside the candidates: `pinned` is how many sessions this instance is holding a pin for, `limit` is the cap it holds them to (`routing.session_table_limit`, evicting the least recently used), and `idle_ttl_secs` is how long a session can go quiet before its pin is dropped (`routing.session_ttl_secs`). It is per instance: a second replica answers this question about its own sessions, and nothing is shared between them.
@@ -317,13 +325,13 @@ Each request gets a span with a `request_id`; a client-supplied W3C `traceparent
 
 A caller that hangs up mid-request (closing the write half or the whole connection) is normal traffic, not a fault: it is logged at `debug` with the caller's address and counted in `sturnus_client_disconnects_total`, while genuine connection faults (such as a failed response write) stay at `error`.
 
-At `debug` each routed request also logs the decision behind its `INFO routing request` line: the alias, the candidate that won, why it won, every candidate's declared share of the alias, and the boxes the placement skipped because they are demoted, with the seconds left on each window — the same numbers `/status` reports:
+At `debug` each proxied request also logs the decision behind its `INFO routing request` line: the alias, the candidate that won, why it won, every candidate's declared share of the alias, every candidate's weight, outstanding turns and busy/idle state as the placement read them, and the boxes the placement skipped because they are demoted, with the seconds left on each window — the same numbers `/status` reports:
 
 ```text
-DEBUG routing decision alias=fast provider=groq model=llama-3.3-70b mode="nonstreaming" reason="fresh-by-weight" session="719f3c2e-4b17-4f0a-9d1c" shares=groq/llama-3.3-70b=60.0% openai/gpt-4o-mini=20.0% local/qwen3-32b=20.0% demoted=local/qwen3-32b=10s
+DEBUG routing decision alias=fast provider=groq model=llama-3.3-70b mode="nonstreaming" reason="fresh-by-weight" session="719f3c2e-4b17-4f0a-9d1c" shares=groq/llama-3.3-70b=60.0% openai/gpt-4o-mini=20.0% local/qwen3-32b=20.0% load=groq/llama-3.3-70b=w3,t1,busy openai/gpt-4o-mini=w1,t0,idle local/qwen3-32b=w1,t0,idle demoted=local/qwen3-32b=10s
 ```
 
-`demoted=` is empty when nothing is demoted, so a healthy alias reads exactly as it did, and `session=` is empty when the request carried no session key. The `reason` is one of `fresh-by-weight` (placed on an idle candidate by weight), `overflow-busy` (every candidate was busy, so the least busy took it), `overflow-demoted` (the alias had nothing eligible, so the heaviest demoted box served the turn), `explicit-pin` (the request rode an `x-session-affinity` pin naming a box, and bypassed placement), `pinned` (the request rode a [session pin](#session-affinity), and bypassed placement). A session key's first turn logs the placement it made, so the line that created the pin reads like any other placement, and only the turns after it read `reason="pinned"`. A transport failure logs its own line at `WARN` naming the window it just started (`demoted_for_secs`), so the demotion and the placement that avoided it are both in the log.
+`shares=` is what the weights declare; `load=` is what the placement found — `w` the declared weight, `t` the turns outstanding on that box, then `busy` or `idle`, the state the busyness rule acts on. Read together, the two answer "why this box, this turn?" from one line: the reason names the shape of the decision, the load names the inputs it was made from. `demoted=` is empty when nothing is demoted, so a healthy alias reads exactly as it did, and `session=` is empty when the request carried no session key. The `reason` is one of `fresh-by-weight` (placed on an idle candidate by weight), `overflow-busy` (every candidate was busy, so the least busy took it), `overflow-demoted` (the alias had nothing eligible, so the heaviest demoted box served the turn), `explicit-pin` (the request rode an `x-session-affinity` pin naming a box, and bypassed placement), `pinned` (the request rode a [session pin](#session-affinity), and bypassed placement). A session key's first turn logs the placement it made, so the line that created the pin reads like any other placement, and only the turns after it read `reason="pinned"`. A transport failure logs its own line at `WARN` naming the window it just started (`demoted_for_secs`), so the demotion and the placement that avoided it are both in the log. Every one of those reasons is also counted on `/metrics` as `sturnus_placements_total`, so the same question is answerable over a window of traffic rather than in one line.
 
 ## Session affinity
 
