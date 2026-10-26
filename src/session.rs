@@ -29,22 +29,25 @@ use hyper::header::HeaderValue;
 /// Default idle TTL for a pin: 30 minutes.
 ///
 /// This is a bound on how long a session is plausibly still going, *not* a
-/// claim that the upstream's prompt cache survived that long — the pin
-/// deliberately outlives every automatic cache retention the mainstream
-/// providers publish. OpenAI caches prefixes of 1024+ tokens and serves a hit
-/// for roughly 5–10 minutes of inactivity (up to an hour for provisioned and
-/// long-context setups); Anthropic's explicit cache TTL is 5 minutes,
-/// refreshed on each hit, with a 1-hour tier at a premium; a self-hosted vLLM
-/// box keeps its KV prefix cache only until GPU memory pressure evicts it,
-/// which under load is minutes. So at 1800s the cache is gone in every one of
-/// those cases, and the entry is kept that long for two reasons that are not
-/// about the cache: a conversation that resumes after a half-hour gap is the
-/// same conversation, and its next turn still costs less on the box that
-/// already holds its system prompt and tool schemas than on a cold one; and a
-/// session that hops boxes every time its owner gets lunch never has a box.
-/// Past 30 minutes a session is more likely dead than resting, and a dead
-/// session holding one candidate at 100% of its traffic is the failure mode
-/// the README names as the cost of affinity — so it places fresh.
+/// claim that the upstream's prompt cache survived that long. What the cache
+/// does was measured on the boxes this proxy runs in front of: a warm
+/// 8348-token prompt re-prefills in 50ms against 9.05s cold on a DDR-based
+/// box, and 58ms against 6.60s on a GPU one; the cache is still warm after
+/// 120s of idle; and it is destroyed by the *next conversation on that box* —
+/// a 53-token turn from another session costs the resident conversation a
+/// full 9.03s re-prefill. So on a single-slot llama.cpp box the cache is not
+/// on a timer at all, and on the hosted providers it is a 5–10 minute
+/// inactivity window (OpenAI) or a 5-minute one (Anthropic). In no case does
+/// a 30-minute TTL match a live cache, and the entry is kept that long for
+/// two reasons that are not about the cache: a conversation that resumes
+/// after a half-hour gap is the same conversation, and its next turn still
+/// costs less on the box that already holds its system prompt and tool
+/// schemas than on a cold one — provided nothing else ran there, which is
+/// what the idle-preference rule in [`crate::router`] exists to keep true;
+/// and a session that hops boxes every time its owner gets lunch never has a
+/// box. Past 30 minutes a session is more likely dead than resting, and a
+/// dead session holding one candidate at 100% of its traffic is the failure
+/// mode the README names as the cost of affinity — so it places fresh.
 pub const DEFAULT_IDLE_TTL_SECS: u64 = 1800;
 
 /// Default LRU cap: 1024 sessions per instance.
@@ -60,6 +63,13 @@ pub const DEFAULT_IDLE_TTL_SECS: u64 = 1800;
 /// table at the cap. Against a default request-buffer budget of 128 MB the
 /// table can never be the thing that OOMs the pod; real keys (an OpenCode
 /// `ses_…` id is 30 bytes) put the same table near 80 KB.
+///
+/// It is a memory bound, not a capacity, and the difference matters: measured
+/// on a llama.cpp box, exactly one conversation is cached at a time — two
+/// interleaved conversations fully evict each other — so the sessions that
+/// are *warm* number about one per box, and the rest of the table is a record
+/// of where conversations have been. Reading the cap as "this many
+/// conversations are warm here" overstates what affinity buys.
 pub const DEFAULT_TABLE_LIMIT: usize = 1024;
 
 /// The longest session key the table accepts.

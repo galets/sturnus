@@ -124,7 +124,14 @@ and `config.example.toml` carries every one of them.
   them; the startup log says so. `/status` reports the table (`sessions_pinned`
   per candidate, and `sessions` with `pinned`, `limit`, `idle_ttl_secs`), and
   the `debug` routing line carries `session=` beside the box, with
-  `reason="pinned"` on the turns that rode a pin.
+  `reason="pinned"` on the turns that rode a pin. What that buys is measured on
+  a llama.cpp box: re-prefilling 8348 tokens costs 9.05s on a DDR-based box and
+  6.60s on a GPU one, against 50–70 ms with the cache warm, and the cache is
+  destroyed by the *next conversation on that box* — a 53-token turn from
+  another session costs the resident conversation a full 9.03s on its next
+  turn. One conversation is warm per box, which is why the pin is at box
+  granularity: [ADR 0002](docs/adr/0002-pin-the-box-not-the-llama-cpp-slot.md)
+  records the measurements and why the router does not steer llama.cpp slots.
 - **The inputs to a placement are logged beside its outcome.** The `debug`
   routing line gains `load=`, listing every candidate of the alias as
   `provider/model=w3,t1,busy` — the weight it declares, the turns it has

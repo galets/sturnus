@@ -113,8 +113,13 @@ shutdown_timeout_secs = 30 # seconds spent finishing in-flight requests on SIGTE
 # min and 1 h tiers at another, memory-pressure eviction on self-hosted
 # boxes) are shorter than this and no single number can track them. The limit
 # is a memory bound on keys this process does not control.
-session_ttl_secs = 1800     # seconds quiet before a session's pin is dropped
-session_table_limit = 1024  # sessions held; the least recently used goes first
+session_ttl_secs = 1800     # seconds quiet before a session's pin is dropped.
+                            # A "same conversation" window, not a cache match: a
+                            # self-hosted box evicts its cache with the next
+                            # conversation, not with a clock
+session_table_limit = 1024  # sessions held; the least recently used goes first.
+                            # A memory bound on caller-invented keys, not a
+                            # count of warm sessions
 
 # The share a weight buys, for an alias of two candidates:
 #
