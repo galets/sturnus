@@ -189,10 +189,14 @@ fn the_schedule_is_pure_and_advances_nothing() {
 
 const BOXES: [&str; 3] = ["a", "b", "c"];
 
-/// The share table in `README.md` and `config.example.toml`, row by row. Every
-/// number in those docs is `weight / sum(weights)`, so a change to the
-/// weighting that moves one of them fails here rather than leaving the docs
-/// describing arithmetic the code no longer runs.
+/// The arithmetic those docs describe, on rows the test itself wrote down.
+///
+/// Every documented share is `weight / sum(weights)`, so a change to the
+/// weighting fails here rather than leaving the docs describing arithmetic the
+/// code no longer runs. The rows the docs actually print are checked by
+/// `the_share_rows_in_the_readme_are_the_arithmetic_the_router_runs` and its
+/// example-config twin, which read them out of the files; this test covers the
+/// cases those tables do not list — three candidates, and a single one.
 #[test]
 fn documented_share_table_matches_the_weighting() {
     let cases: &[(&[usize], &[f64])] = &[
@@ -215,6 +219,122 @@ fn documented_share_table_matches_the_weighting() {
         let shares: Vec<f64> = schedule.entries.iter().map(|e| e.share).collect();
         assert_eq!(&shares, expected, "weights {weights:?}");
     }
+}
+
+/// The share rows a docs file claims, as `(weights, documented shares)`.
+///
+/// `README.md` writes the table as Markdown and `config.example.toml` writes
+/// the same four rows as comments; both are read here as the text an operator
+/// reads, so the docs cannot drift from the router while the test keeps
+/// passing on a private copy of the numbers.
+fn documented_share_rows(file: &str) -> Vec<(Vec<usize>, Vec<String>)> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read {} to check its share table: {e}",
+            path.display()
+        )
+    });
+    share_rows_in(&text)
+}
+
+/// Pick the share rows out of a docs file's text.
+///
+/// A row is two integers around a colon — `19 : 1` — followed by one
+/// percentage per weight. Pipes and `#` are stripped so the Markdown table and
+/// the commented table parse the same way, and a line with no percentages
+/// (a header, a separator, prose about a 95% share) is not a row.
+fn share_rows_in(text: &str) -> Vec<(Vec<usize>, Vec<String>)> {
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let line = line.replace(['|', '#'], " ");
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let Some(colon) = tokens.iter().position(|token| *token == ":") else {
+            continue;
+        };
+        let first = colon
+            .checked_sub(1)
+            .and_then(|i| tokens[i].parse::<usize>().ok());
+        let second = tokens
+            .get(colon + 1)
+            .and_then(|token| token.parse::<usize>().ok());
+        let (Some(first), Some(second)) = (first, second) else {
+            continue;
+        };
+        let shares: Vec<String> = tokens[colon + 2..]
+            .iter()
+            .filter(|token| token.ends_with('%'))
+            .map(|token| (*token).to_string())
+            .collect();
+        if shares.is_empty() {
+            continue;
+        }
+        rows.push((vec![first, second], shares));
+    }
+    rows
+}
+
+/// Recompute every documented row with [`placement_schedule`] and compare at
+/// the precision the doc writes: `66.7%` is the arithmetic rounded to one
+/// decimal, `50%` to none. A row that disagrees is a doc bug, so the message
+/// names the file, the row, and the number the router actually gives.
+fn assert_share_rows_match_the_weighting(rows: &[(Vec<usize>, Vec<String>)], file: &str) {
+    let pairs: Vec<Vec<usize>> = rows.iter().map(|(weights, _)| weights.clone()).collect();
+    assert_eq!(
+        pairs,
+        vec![vec![1, 1], vec![2, 1], vec![3, 1], vec![19, 1]],
+        "{file} is expected to carry the share rows 1:1, 2:1, 3:1 and 19:1, in that order; \
+         the test reads them as `w : w` followed by one percentage per weight"
+    );
+
+    for (weights, documented) in rows {
+        let specs: Vec<(&str, usize)> = weights
+            .iter()
+            .enumerate()
+            .map(|(i, weight)| (BOXES[i], *weight))
+            .collect();
+        let (candidates, _tracker, _rr) = setup(&specs);
+        let schedule = placement_schedule(&candidates);
+        assert_eq!(
+            documented.len(),
+            schedule.entries.len(),
+            "{file} gives weights {weights:?} {} shares, but that alias has {} candidates",
+            documented.len(),
+            schedule.entries.len()
+        );
+
+        for (entry, doc) in schedule.entries.iter().zip(documented) {
+            let decimals = doc
+                .trim_end_matches('%')
+                .split('.')
+                .nth(1)
+                .map_or(0, |part| part.len());
+            let computed = format!("{:.1$}%", entry.share * 100.0, decimals);
+            let share = entry.share * 100.0;
+            let weight = entry.weight;
+            let total = schedule.total_weight;
+            assert_eq!(
+                computed, *doc,
+                "{file} documents weights {weights:?} as {documented:?}, but \
+                 placement_schedule gives {share:.0$}% for weight {weight} of a \
+                 total weight {total} — fix the doc, not this test",
+                decimals
+            );
+        }
+    }
+}
+
+#[test]
+fn the_share_rows_in_the_readme_are_the_arithmetic_the_router_runs() {
+    assert_share_rows_match_the_weighting(&documented_share_rows("README.md"), "README.md");
+}
+
+#[test]
+fn the_share_rows_in_the_example_config_are_the_arithmetic_the_router_runs() {
+    assert_share_rows_match_the_weighting(
+        &documented_share_rows("config.example.toml"),
+        "config.example.toml",
+    );
 }
 
 #[test]

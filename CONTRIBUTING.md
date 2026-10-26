@@ -40,6 +40,8 @@ sturnus is intentionally a lean, single-binary routing layer, not an LLMOps plat
 
 If you're unsure whether a change fits, please open an issue first.
 
+The reasoning behind the shape of the routing is recorded in [`docs/adr`](docs/adr) — [ADR 0001](docs/adr/0001-declared-weights-over-measured-latency.md) is why an alias is divided by declared `weight` and not by measured latency.
+
 ## Reporting security issues
 
 Please do not open a public issue for security vulnerabilities. See [SECURITY.md](SECURITY.md).

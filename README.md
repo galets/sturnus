@@ -69,7 +69,7 @@ response = client.chat.completions.create(
 
 ## Why sturnus
 
-Most LLM gateways are either a hosted SaaS you route all your traffic (and keys) through, or a large application with a significant surface area. sturnus is the opposite — **a single static binary** with a small auditable surface area, MIT-licensed and running entirely inside your infrastructure. It speaks the OpenAI API, so any OpenAI-compatible SDK works by changing one base URL. The core capability of sturnus is routing one model across several providers by declared weights — something that most gateways put behind an enterprise tier. Each sidecar routes independently from what it observes locally, so there is no shared state to run.
+Most LLM gateways are either a hosted SaaS you route all your traffic (and keys) through, or a large application with a significant surface area. sturnus is the opposite — **a single static binary** with a small auditable surface area, MIT-licensed and running entirely inside your infrastructure. It speaks the OpenAI API, so any OpenAI-compatible SDK works by changing one base URL. The core capability of sturnus is routing one model across several providers by declared weights — something that most gateways put behind an enterprise tier. Each sidecar routes from its own config and its own local state, so there is no shared state to run.
 
 If you need a full LLMOps platform (spend tracking, prompt management, a UI, dozens of integrations), sturnus is not that.
 
@@ -78,8 +78,10 @@ If you need a full LLMOps platform (spend tracking, prompt management, a UI, doz
 
 sturnus has a bounded scope by design and has some deliberate omissions:
 
-- **No request-level failover or retries.** sturnus is a transparent proxy: it surfaces upstream errors to the client verbatim rather than silently retrying within a black box. An error is recorded against the provider that produced it and shows up on `/status`, but it does not move traffic — the individual failed request is returned as-is. Client SDKs (OpenAI, Anthropic, LangChain, etc.) already ship mature, configurable retry and backoff; configure it there and let the caller decide what a failure is worth retrying.
+- **No request-level failover or retries.** sturnus is a transparent proxy: it surfaces upstream errors to the client verbatim rather than silently retrying within a black box. An upstream `4xx`/`5xx` is recorded against the provider that produced it and shows up on `/status`, but it does not move traffic — the individual failed request is returned as-is. Client SDKs (OpenAI, Anthropic, LangChain, etc.) already ship mature, configurable retry and backoff; configure it there and let the caller decide what a failure is worth retrying. The one thing sturnus does act on is a box that never answered at all: that starts a [demotion window](#the-demotion-window), which moves *new* sessions away and retries nothing.
 - **Declared weights, not cost or quality-based.** Routing divides an alias by the weights you declare, and every model routed under that alias should be largely interchangeable. sturnus never trades quality or cost for speed, and it never measures its way to a preference you could have written down: a box is fast because the operator says it is fast.
+
+The reasoning behind these choices is recorded in [`docs/adr`](docs/adr) — starting with [ADR 0001](docs/adr/0001-declared-weights-over-measured-latency.md), why the routing is by declared weight and not by measured latency.
 
 </details>
 
@@ -125,6 +127,8 @@ fast = [
 [routing]
 ewma_alpha = 0.3          # smoothing for the latency and success-rate EWMAs, which /status reports and routing ignores
 demotion_secs = 10         # seconds an unreachable box takes no new sessions for
+session_ttl_secs = 1800    # seconds a session may go quiet before this instance drops its pin
+session_table_limit = 1024 # sessions this instance pins at most, the least recently used going first
 ```
 
 See [`config.example.toml`](config.example.toml) for all providers (Groq, Azure, Google AI Studio, Anthropic, local OpenAI-compatible) and options.
@@ -358,7 +362,7 @@ x-session-affinity: provider/model        ← an explicit pin: route to this box
 x-session-affinity: 719f3c2e-4b17-4f0a-…  ← a session key: keep this conversation put
 ```
 
-A **pin** is a model name, so it is routed like any other request: the model must be in the config, and the box serving it is chosen by the weights. It is fully stateless — the header carries the whole decision, so it works across pods with no shared state. Every response echoes one, which is why the snippet above works: the client is sending a pin, not a session.
+A **pin** is a model name. The pair must name a candidate of the alias the request asks for, and that candidate serves the request: the header names the box outright, so no weight is consulted and no placement is made. It is fully stateless — the header carries the whole decision, so it works across pods with no shared state. Every response echoes one, which is why the snippet above works: the client is sending a pin, not a session.
 
 A **session key** is not a model, so it is not routed at all. It is a label — a conversation id from the client's own session store — and the router gives that label a home: the first turn of a session is placed by the normal rules, and every later turn of that session rides to the same box, busy or not. That is the shape a client with prompt caching wants: the box that has already paid for the prompt is the box worth queuing behind.
 
@@ -379,7 +383,7 @@ What a session pin buys, and what it costs:
 ## How routing works
 
 1. Client sends `POST /v1/chat/completions` with `"model": "fast"`.
-2. The `x-session-affinity` header is read before anything is placed, and its shape decides what it means: a `provider/model` value names a box outright, and a value without a slash is a session key whose pin is looked up. Both bypass steps 3–6. A key with no live pin — new, quiet past the idle TTL, evicted at the table cap, or pinned to a box that is now demoted — falls through to placement, and the box it lands on becomes that key's pin.
+2. The `x-session-affinity` header is read before anything is placed, and its shape decides what it means: a `provider/model` value names a box outright, and a value without a slash is a session key whose pin is looked up. Both bypass placement — steps 3–7 — and are forwarded to the box they name. A key with no live pin — new, quiet past the idle TTL, evicted at the table cap, or pinned to a box that is now demoted — falls through to placement, and the box it lands on becomes that key's pin. That is a permanent re-pin: a session overflowed off a demoted box follows its new box from then on, and nothing moves it back when the old box's window ends.
 3. Sidecar looks up the `fast` alias and reads each candidate's declared `weight` (an integer, default 1). A candidate's share of the alias is `its weight / sum of weights` — that is the entire allocation policy, and nothing measured — latency, error rate, queue depth — scales it.
 4. Eligibility is applied first, as a gate and not a discount: a candidate inside a demotion window is not asked at all, so its share while demoted is exactly zero. No slice of the alias is held aside for it, because nothing probes a demoted box back.
 5. Among the eligible candidates, busyness decides who gets asked and weight decides between them. A candidate with a prompt running is passed over for an idle one whatever its weight; when every candidate is busy the least busy group competes, and weight breaks that tie.
@@ -401,7 +405,7 @@ For an alias of two candidates:
 | 3 : 1   | 75%           | 25%       |
 | 19 : 1  | 95%           | 5%        |
 
-Every number is `weight / sum(weights)`, and `documented_share_table_matches_the_weighting` pins these rows against the arithmetic the router runs, so a change to the weighting fails a test rather than leaving this table describing arithmetic the code no longer runs. Weights allocate picks, and the Weyl stride is low-discrepancy rather than exact per window: over a short run the observed split drifts around the declared share, and `/status` reports the declared one.
+Every number is `weight / sum(weights)`. The test `router::tests::the_share_rows_in_the_readme_are_the_arithmetic_the_router_runs` reads these four rows — and the same four in [`config.example.toml`](config.example.toml) — out of the files as written, recomputes each with the same `placement_schedule` the picker draws from, and fails if a documented percentage disagrees, so the tables are pinned as prose rather than against a copy of themselves kept next to the test. `documented_share_table_matches_the_weighting` covers the rows the tables do not list: three candidates in one alias, and a single one. Weights allocate picks, and the Weyl stride is low-discrepancy rather than exact per window: over a short run the observed split drifts around the declared share, and `/status` reports the declared one.
 
 A candidate that should never serve is left out of the alias's list. `weight = 0` is a startup error naming the alias and the candidate, because the weighted draw has no way to express "never".
 
@@ -425,8 +429,9 @@ The routing keys are `ewma_alpha` (the smoothing of the EWMAs `/status` reports)
 - **Making a measured number count.** Latency, error rate and queue depth are recorded and reported, and no weight is scaled by any of them. There is no sharpness knob to turn, and `routing.exploit_k` — the knob this design removed — is a startup error naming `weight` as its replacement, not a key that loads and does nothing.
 - **Grading a box's health on a curve.** `routing.error_threshold` — the error-rate EWMA above which a session-affinity pin was broken — is gone for the same reason: a startup error naming `demotion_secs`. Health is binary on purpose: a box that answered is up, a box that did not is stood down for a window. There is no key for the failure rate that starts a window, no decay curve, no half-life, and no threshold at which a box is "bad enough".
 - **Probing a demoted box back.** There is no probe share, no probe interval, no ramp, and no recovery ladder to configure: the window expires and the box is at full weight, and the first session placed on it is the probe.
-- **Disabling session affinity, or tuning how hard a live session sticks.** A caller-supplied `x-session-affinity` pin is honored whatever the pinned box is doing — there is no turn limit, no error rate that breaks it, and no setting that ignores the header. A handful of long-lived sessions can therefore hold one candidate at 100% of their own traffic however idle it looks to the router. The two keys that do exist bound the *table*, not the affinity: `session_ttl_secs` is how long a session may go quiet before its pin is dropped, and `session_table_limit` is how many sessions are held before the least recently used goes. Neither changes where a live, in-window session goes.
+- **Disabling session affinity, or tuning how hard a live session sticks.** A caller-supplied `x-session-affinity` pin is honored whatever the pinned box is doing — there is no turn limit, no error rate that breaks it, and no setting that ignores the header. Nor is a pinned session rebalanced turn by turn: no key makes the router re-place a live session because another box looks idle, and no key makes it stop queueing where it is. A handful of long-lived sessions can therefore hold one candidate at 100% of their own traffic however idle it looks to the router. The two keys that do exist bound the *table*, not the affinity: `session_ttl_secs` is how long a session may go quiet before its pin is dropped, and `session_table_limit` is how many sessions are held before the least recently used goes. Neither changes where a live, in-window session goes.
 - **A floor, a ceiling, or a preference a box carries.** Weight is declared per candidate inside one alias's list, so the same box can be `weight = 3` in one alias and `weight = 1` in another; there is no global preference, no floor keeping a broken box sampled, and no ceiling on a healthy one. The list is the policy.
+- **Sharing a pin between replicas.** A pin lives in the memory of the instance that made it. There is no key for Redis, a database, a hash ring, or a shared cache, and no key that makes two replicas agree on where a session goes — behind a load balancer each replica places the session on its own first turn. The half that does cross replicas is stateless and needs no key: every response echoes a `provider/model`, and a caller that sends that back names the box to whichever instance receives it.
 
 ## Docker
 

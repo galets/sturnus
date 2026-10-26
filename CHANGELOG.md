@@ -11,6 +11,15 @@ their history lives in the git log and tags.
 
 ## [Unreleased]
 
+**Breaking for configs that set a removed routing key.** Two `routing` keys are
+gone: `routing.exploit_k` and `routing.error_threshold`. A config that sets
+either one stops at startup, naming the key and what replaced it, rather than
+loading and tuning nothing — the fix is to delete the key. The exact startup
+text is quoted under each entry below. No other config change is needed:
+`weight` (per candidate, default 1), `routing.demotion_secs`,
+`routing.session_ttl_secs` and `routing.session_table_limit` all have defaults,
+and `config.example.toml` carries every one of them.
+
 ### Added
 
 - **`api_keys`** — an optional top-level config list that gates the proxy. When
@@ -53,11 +62,11 @@ their history lives in the git log and tags.
   from those live counts on every scrape rather than incremented per request, so
   the exported value cannot drift from the count. Zero-initialised at startup
   alongside the failure counters, so an idle candidate reads `0` rather than no
-  series. The point is to make queueing visible before any routing change reacts
-  to it: an agent that fires a same-instant pair of requests shows both of them
-  waiting on one box while the alias's other candidate sits at zero, which
-  nothing in the router acts on today: the count is visible before any placement
-  rule consults it. A box
+  series. The point is to make queueing visible: an agent that fires a
+  same-instant pair of requests shows both of them waiting on one box while the
+  alias's other candidate sits at zero — and that is the same count the
+  placement rule added in this release reads to prefer an idle box, so the
+  number on show is the number the decision used. A box
   reachable through several aliases reports the same number under each of its
   label sets, because it is one box's queue.
 
@@ -92,9 +101,10 @@ their history lives in the git log and tags.
   (`fresh-by-weight` when an idle box existed, `overflow-busy` when none did).
 - **A session key pins a conversation to one box.** `x-session-affinity` names
   two different things, and the router reads it as the shape it finds. A value
-  containing a slash is a `provider/model` **pin**: it names a box outright, it
-  is routed like any other request, and it is stateless — the header carries the
-  whole decision, so it works across replicas with nothing shared. Any other
+  containing a slash is a `provider/model` **pin**: it names a box outright, that
+  box serves the turn with no placement made, and it is stateless — the header
+  carries the whole decision, so it works across replicas with nothing shared.
+  Any other
   usable value is a **session key**: a conversation id from the caller, which is
   not routed at all. Its first turn is placed by the normal rules, and every
   later turn of that session rides to the same box, busy or not — the box that
@@ -156,11 +166,7 @@ their history lives in the git log and tags.
   startup naming what replaced it:
 
   ```text
-  routing.error_threshold is no longer used: a transport failure (connect, DNS,
-  TLS, connect timeout, read timeout) demotes a candidate for
-  `routing.demotion_secs` seconds (default 10), an upstream 4xx/5xx is relayed
-  and does not demote, and a pin is honored whatever the pinned box's error
-  rate; remove error_threshold
+  routing.error_threshold is no longer used: a transport failure (connect, DNS, TLS, connect timeout, read timeout) demotes a candidate for `routing.demotion_secs` seconds (default 10), an upstream 4xx/5xx is relayed and does not demote, and a pin is honored whatever the pinned box's error rate; remove error_threshold
   ```
 
   The migration is to delete the key. A pin that used to break after roughly
@@ -178,8 +184,7 @@ their history lives in the git log and tags.
   replaced it, rather than loading and tuning nothing:
 
   ```text
-  routing.exploit_k is no longer used: traffic is allocated by each candidate's
-  declared `weight` (an integer, default 1) in the [model] alias list; remove exploit_k
+  routing.exploit_k is no longer used: traffic is allocated by each candidate's declared `weight` (an integer, default 1) in the [model] alias list; remove exploit_k
   ```
 
   The migration is to write the split down. The box that a 2x latency gap and

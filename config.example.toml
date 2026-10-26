@@ -81,13 +81,27 @@ code = [
 ]
 
 [routing]
-ewma_alpha = 0.3          # EWMA smoothing factor (higher = more reactive)
+# Every routing knob is here. What a candidate gets is `weight` (per candidate,
+# in the [model] list above) and `demotion_secs`; what a session keeps is
+# `session_ttl_secs` and `session_table_limit`; the rest are timeouts and size
+# caps. There is no key for a measured share, a probe share, a recovery ladder,
+# or a pin shared between replicas — see "What config cannot do" in the README.
+ewma_alpha = 0.3          # EWMA smoothing factor (higher = more reactive). The
+                          # EWMAs it smooths are what /status reports; routing
+                          # ignores them
 demotion_secs = 10        # seconds a box takes no new sessions for after a
                           # transport failure (connect, DNS, TLS, connect
                           # timeout, read timeout). An upstream 4xx/5xx is
                           # relayed and does not demote. 0 asks for no window.
 connect_timeout_secs = 10  # max seconds to establish upstream connection
 read_timeout_secs = 60     # max seconds between chunks before treating upstream as hung
+max_body_bytes = 33554432  # 32 MB: the cap on one request body; a larger body is 413
+# max_buffered_bytes = 134217728
+#   Aggregate cap on the request bytes buffered across all in-flight requests.
+#   Beyond it new requests are shed with 429 + Retry-After rather than growing
+#   the pod. Default: half the container's cgroup memory limit when one is set,
+#   else 4x max_body_bytes.
+shutdown_timeout_secs = 30 # seconds spent finishing in-flight requests on SIGTERM
 
 # Session pins: how long an `x-session-affinity` session key keeps its box.
 # A session key's first turn is placed by weight; every later turn rides the
@@ -110,9 +124,16 @@ session_table_limit = 1024  # sessions held; the least recently used goes first
 #   3 : 1        75%             25%
 #   19 : 1       95%             5%
 #
-# Weights allocate sessions, so the share of *turns* an operator sees drifts
-# around the declared share of sessions; `/status` reports both. A candidate
-# that should never serve is left out of the list, not weighted at zero.
+# Every number is that weight over the sum of the alias's weights, and the test
+# router::tests::the_share_rows_in_the_example_config_are_the_arithmetic_the_router_runs
+# reads these rows out of this file and recomputes them with the router's own
+# arithmetic, so a row that stops matching the code fails the suite. Weights
+# allocate picks, and the draw is low-discrepancy rather than exact per window,
+# so the share of *turns* an operator sees drifts around the declared share
+# over a short run; `/status` reports the declared share beside the turns each
+# box has actually served. A candidate that should never serve is left out of
+# the list, not weighted at zero: `weight = 0` is a startup error naming the
+# alias and the candidate.
 
 # Vertex billing labels: merged into outbound bodies for any vertex_ai
 # provider with `attribution = true` (add the flag to its vertex_ai
